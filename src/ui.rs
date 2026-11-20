@@ -441,19 +441,32 @@ unsafe fn set_row_title(item: Obj, left: &str, right: &str, tab_stop: f64, dim: 
     objc::release(attributed);
 }
 
-/// Left edge of the value column: past the widest label plus a gutter. The
-/// values are left-aligned here rather than right-aligned at a shared edge, so
-/// a long value like "46.8 °C" starts where every other value starts instead
-/// of running back over its label.
-fn tab_stop_for(labels: &[String]) -> f64 {
-    (widest_text(labels).ceil() + COLUMN_GUTTER).ceil()
+/// Right edge of the value column. Values are right-aligned here, so a short
+/// value sits against the same edge as a long one; the widest value's own
+/// width is part of the stop, otherwise the longest value would run back over
+/// its label instead of ending at that edge.
+fn tab_stop_for(labels: &[String], values: &[String]) -> f64 {
+    let widest_label = widest_text(labels, false);
+    let widest_value = widest_text(values, true);
+    (widest_label.ceil() + COLUMN_GUTTER + widest_value.ceil()).ceil()
 }
 
 const COLUMN_GUTTER: f64 = 22.0;
 
-fn widest_text(items: &[String]) -> f64 {
+/// Values are drawn in the monospaced-digit font, so they have to be measured
+/// in it too; the menu font is narrower and would under-reserve the column.
+fn widest_text(items: &[String], monospaced_digits: bool) -> f64 {
     unsafe {
-        let font = objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0);
+        let font = if monospaced_digits {
+            objc::send_obj_two_floats(
+                objc::class("NSFont"),
+                "monospacedDigitSystemFontOfSize:weight:",
+                objc::system_font_size(),
+                0.0,
+            )
+        } else {
+            objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0)
+        };
         let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
         objc::send_void_obj_obj(attributes, "setObject:forKey:", font, objc::nsstring("NSFont"));
         let mut widest: f64 = 0.0;
@@ -479,7 +492,20 @@ fn populate(state: &mut AppState, menu: Obj) {
             .iter()
             .map(|category| category.title().to_string())
             .collect();
-        state.row_tab = tab_stop_for(&labels);
+        let values: Vec<String> = ALL_CATEGORIES
+            .iter()
+            .map(|category| {
+                let reading = state.store.get(*category);
+                let value =
+                    reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
+                if value.has_data() {
+                    value.text.clone()
+                } else {
+                    "No data".to_string()
+                }
+            })
+            .collect();
+        state.row_tab = tab_stop_for(&labels, &values);
         let row_tab = state.row_tab;
 
         for category in ALL_CATEGORIES {
@@ -573,7 +599,10 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
                 }
             }))
             .collect();
-        let tab = tab_stop_for(&labels);
+        let values: Vec<String> = std::iter::once(reading.average.text.clone())
+            .chain(reading.sensors.iter().map(|sensor| sensor.reading.text.clone()))
+            .collect();
+        let tab = tab_stop_for(&labels, &values);
         state.sensor_tabs[category.index()] = tab;
 
         let average = action_item("Average", state.controller, category_tag(category, None));
@@ -974,7 +1003,7 @@ pub fn dump_menu() -> String {
                 diag::selection_summary(&state.prefs)
             ));
             out.push_str(&format!(
-                "\n## Columns (value column starts at {:.1} pt)\n",
+                "\n## Columns (value column ends at {:.1} pt)\n",
                 state.row_tab
             ));
             let font = objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0);
@@ -987,14 +1016,13 @@ pub fn dump_menu() -> String {
                 let text = if value.has_data() { &value.text } else { "No data" };
                 let label_width = text_width(objc::nsstring(category.title()), attrs);
                 let value_width = text_width(objc::nsstring(text), attrs);
-                let _ = value_width;
                 out.push_str(&format!(
                     "   {:<12} label ends {:>6.1}, value starts {:>6.1}, gap {:>5.1}, ends {:>6.1}\n",
                     category.title(),
                     label_width,
-                    state.row_tab,
-                    state.row_tab - label_width,
-                    state.row_tab + value_width
+                    state.row_tab - value_width,
+                    state.row_tab - value_width - label_width,
+                    state.row_tab
                 ));
             }
             let size = objc::send_size(menu, "size");
