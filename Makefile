@@ -9,7 +9,7 @@ BUNDLE      := dist/$(APP_NAME).app
 RELEASE_BIN := target/release/vitals
 INSTALL_DIR := /Applications
 
-.PHONY: build app run install uninstall dump verify clean
+.PHONY: build app run install uninstall dump verify clean icon
 
 build:
 	$(BUILD_ENV) $(CARGO) build --release
@@ -21,6 +21,7 @@ app: build
 	cp $(RELEASE_BIN) $(BUNDLE)/Contents/MacOS/$(APP_NAME)
 	cp packaging/Info.plist $(BUNDLE)/Contents/Info.plist
 	cp packaging/Phosphor.ttf $(BUNDLE)/Contents/Resources/Phosphor.ttf
+	cp packaging/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
 	printf 'APPL????' > $(BUNDLE)/Contents/PkgInfo
 	codesign --force --sign - --timestamp=none $(BUNDLE)
 	@codesign --verify --strict $(BUNDLE) && echo "✔ signed and ready: $(BUNDLE)"
@@ -47,6 +48,13 @@ verify: app
 
 dump: build
 	$(RELEASE_BIN) --dump
+
+# Regenerates the app icon from tools/make-icon.swift.
+icon:
+	swiftc -O tools/make-icon.swift -o /tmp/vitals-make-icon
+	/tmp/vitals-make-icon packaging
+	iconutil -c icns packaging/Vitals.iconset -o packaging/AppIcon.icns
+	@echo "✔ packaging/AppIcon.icns"
 
 clean:
 	$(BUILD_ENV) $(CARGO) clean && rm -rf dist
