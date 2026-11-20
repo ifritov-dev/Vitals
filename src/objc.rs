@@ -38,6 +38,7 @@ extern "C" {
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
     pub static NSRunLoopCommonModes: Obj;
+    pub static NSEventTrackingRunLoopMode: Obj;
 }
 
 #[link(name = "AppKit", kind = "framework")]

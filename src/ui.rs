@@ -29,6 +29,7 @@ struct AppState {
     /// Tag -> menu item, so open menus can be updated in place.
     live_items: HashMap<isize, Obj>,
     open_menu: Obj,
+    tracking_timer: Obj,
     last_refresh: Instant,
     last_signature: String,
 }
@@ -57,8 +58,6 @@ pub fn run() {
         let app = objc::send(objc::class("NSApplication"), "sharedApplication");
         // LSUIElement is in Info.plist; accessory keeps it true from a terminal.
         objc::send_void_int(app, "setActivationPolicy:", 1);
-
-        objc::send_void_int(app, "setActivationPolicy:", 1);
         let controller = make_controller();
         let mut store = SensorStore::new();
         store.refresh();
@@ -71,6 +70,7 @@ pub fn run() {
             status_items: Vec::new(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
+            tracking_timer: std::ptr::null_mut(),
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -86,10 +86,43 @@ pub fn run() {
             std::ptr::null_mut(),
             true,
         );
-        // .common is what keeps the ticker alive while a menu is tracking,
-        // which is what makes an open dropdown update in place.
         let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
         objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, NSRunLoopCommonModes);
+
+        if std::env::args().any(|a| a == "--demo-open") {
+            let opener = objc::send_timer(
+                objc::class("NSTimer"),
+                "timerWithTimeInterval:target:selector:userInfo:repeats:",
+                2.0,
+                controller,
+                objc::selector("demoOpen:"),
+                std::ptr::null_mut(),
+                false,
+            );
+            objc::send_void_obj_obj(run_loop, "addTimer:forMode:", opener, NSRunLoopCommonModes);
+            let closer = objc::send_timer(
+                objc::class("NSTimer"),
+                "timerWithTimeInterval:target:selector:userInfo:repeats:",
+                5.0,
+                controller,
+                objc::selector("demoClose:"),
+                std::ptr::null_mut(),
+                false,
+            );
+            objc::send_void_obj_obj(run_loop, "addTimer:forMode:", closer, NSRunLoopCommonModes);
+            if std::env::args().any(|a| a == "--demo-actions") {
+                let actions = objc::send_timer(
+                    objc::class("NSTimer"),
+                    "timerWithTimeInterval:target:selector:userInfo:repeats:",
+                    3.0,
+                    controller,
+                    objc::selector("demoActions:"),
+                    std::ptr::null_mut(),
+                    false,
+                );
+                objc::send_void_obj_obj(run_loop, "addTimer:forMode:", actions, NSRunLoopCommonModes);
+            }
+        }
 
         objc::send_void(app, "run");
     }
@@ -101,18 +134,84 @@ unsafe extern "C" fn tick_imp(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| tick(state));
 }
 
+extern "C" fn tick_source(_context: *mut std::ffi::c_void) {
+    with_state(|state| tick(state));
+}
+
 unsafe extern "C" fn menu_needs_update(_this: Obj, _cmd: Sel, menu: Obj) {
     with_state(|state| populate(state, menu));
 }
 
 unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
-    with_state(|state| state.open_menu = menu);
+    with_state(|state| {
+        state.open_menu = menu;
+        // A menu tracks in NSEventTrackingRunLoopMode, where the regular
+        // ticker does not run; this one keeps the open dropdown live.
+        let controller = state.controller;
+        let timer = objc::send_timer(
+            objc::class("NSTimer"),
+            "timerWithTimeInterval:target:selector:userInfo:repeats:",
+            0.4,
+            controller,
+            objc::selector("tick:"),
+            std::ptr::null_mut(),
+            true,
+        );
+        let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
+        objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, objc::NSEventTrackingRunLoopMode);
+        state.tracking_timer = timer;
+    });
 }
 
 unsafe extern "C" fn menu_did_close(_this: Obj, _cmd: Sel, _menu: Obj) {
     with_state(|state| {
+        if !state.tracking_timer.is_null() {
+            objc::send_void(state.tracking_timer, "invalidate");
+            state.tracking_timer = std::ptr::null_mut();
+        }
         state.open_menu = std::ptr::null_mut();
         state.live_items.clear();
+    });
+}
+
+/// Exercises the action paths the mouse would take, without a mouse.
+unsafe extern "C" fn demo_actions(_this: Obj, _cmd: Sel, _timer: Obj) {
+    with_state(|state| {
+        eprintln!("demo: selecting a sensor for Temperature");
+        dispatch(state, category_tag(Category::Temperature, Some(4)));
+        eprintln!("demo: selecting Average again");
+        dispatch(state, category_tag(Category::Temperature, None));
+        eprintln!("demo: toggling the compact slot");
+        dispatch(state, TAG_COMPACT);
+        dispatch(state, TAG_COMPACT);
+        eprintln!("demo: toggling a menu bar category");
+        dispatch(state, -((Category::Battery.index() as isize) + 1));
+        dispatch(state, -((Category::Battery.index() as isize) + 1));
+        eprintln!("demo: changing the interval");
+        dispatch(state, TAG_INTERVAL_BASE - 5);
+        eprintln!("demo: actions done");
+    });
+}
+
+unsafe extern "C" fn demo_close(_this: Obj, _cmd: Sel, _timer: Obj) {
+    with_state(|state| {
+        if !state.open_menu.is_null() {
+            eprintln!("demo: cancelling tracking");
+            objc::send_void(state.open_menu, "cancelTracking");
+            eprintln!("demo: tracking cancelled");
+        }
+    });
+}
+
+unsafe extern "C" fn demo_open(_this: Obj, _cmd: Sel, _timer: Obj) {
+    with_state(|state| {
+        if let Some(item) = state.status_items.first().copied() {
+            if let Some(button) = button_of(item) {
+                eprintln!("demo: clicking status item");
+                objc::send_void_obj(button, "performClick:", std::ptr::null_mut());
+                eprintln!("demo: menu closed again");
+            }
+        }
     });
 }
 
@@ -127,8 +226,11 @@ fn make_controller() -> Obj {
         let cls = objc::objc_allocateClassPair(objc::class("NSObject"), name.as_ptr(), 0);
         let void_obj = CString::new("v@:@").unwrap();
 
-        let methods: [(&str, *const ()); 5] = [
+        let methods: [(&str, *const ()); 8] = [
             ("tick:", tick_imp as *const ()),
+            ("demoOpen:", demo_open as *const ()),
+            ("demoClose:", demo_close as *const ()),
+            ("demoActions:", demo_actions as *const ()),
             ("menuNeedsUpdate:", menu_needs_update as *const ()),
             ("menuWillOpen:", menu_will_open as *const ()),
             ("menuDidClose:", menu_did_close as *const ()),
@@ -236,7 +338,9 @@ fn update_status_titles(state: &mut AppState) {
             if title.is_empty() {
                 title.append_string("Vitals");
             }
-            objc::send_void_obj(button, "setAttributedTitle:", title.finish());
+            let finished = title.finish();
+            objc::send_void_obj(button, "setAttributedTitle:", finished);
+            objc::release(finished);
             let tooltip = categories
                 .iter()
                 .map(|category| {
@@ -265,7 +369,9 @@ fn update_status_titles(state: &mut AppState) {
                     "\u{2009}{}",
                     if value.has_data() { &value.compact } else { "—" }
                 ));
-                objc::send_void_obj(button, "setAttributedTitle:", title.finish());
+                let finished = title.finish();
+                objc::send_void_obj(button, "setAttributedTitle:", finished);
+                objc::release(finished);
             }
         }
     }
@@ -321,6 +427,8 @@ fn action_item(title: &str, controller: Obj, tag: isize) -> Obj {
 unsafe fn set_row_title(item: Obj, left: &str, right: &str, tab_stop: f64, dim: bool) {
     let attributed = Attributed::row(left, right, tab_stop, dim);
     objc::send_void_obj(item, "setAttributedTitle:", attributed);
+    // The item retains it; this drops the +1 we hold from -initWithAttributedString:.
+    objc::release(attributed);
 }
 
 fn tab_stop_for(labels: &[String]) -> f64 {
@@ -333,8 +441,6 @@ fn tab_stop_for(labels: &[String]) -> f64 {
             let text = objc::nsstring(label);
             let size = text_width(text, attributes);
             widest = widest.max(size);
-            objc::release(attributes);
-            objc::release(text);
         }
         widest.ceil() + 22.0
     }
@@ -629,6 +735,7 @@ impl Attributed {
                 objc::nsstring(text),
             );
             objc::send_void_obj(self.string, "appendAttributedString:", piece);
+            objc::release(piece);
             self.length += text.chars().count();
             self.empty = false;
         }
@@ -654,6 +761,9 @@ impl Attributed {
                 attachment,
             );
             objc::send_void_obj(self.string, "appendAttributedString:", piece);
+            // `piece` comes from a class factory and is autoreleased; only the
+            // attachment we alloc/init'd is ours to release.
+            objc::release(attachment);
             self.length += 1;
             self.empty = false;
         }
@@ -810,6 +920,7 @@ pub fn dump_menu() -> String {
             status_items: Vec::new(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
+            tracking_timer: std::ptr::null_mut(),
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
