@@ -188,7 +188,8 @@ pub unsafe fn send_size_obj(obj: Obj, sel: &str, a: Obj) -> NSSize {
     function(obj, selector(sel), a)
 }
 
-/// `-[NSTextTab initWithTextAlignment:location:options:]` with right alignment.
+/// `-[NSTextTab initWithTextAlignment:location:options:]`. NSTextAlignmentRight
+/// is 1 — 2 is centre, which staggers the column instead of aligning it.
 pub unsafe fn send_tab(location: f64) -> Obj {
     let options = send(class("NSDictionary"), "dictionary");
     let function: unsafe extern "C" fn(Obj, Sel, isize, f64, Obj) -> Obj =
@@ -196,7 +197,7 @@ pub unsafe fn send_tab(location: f64) -> Obj {
     function(
         alloc("NSTextTab"),
         selector("initWithTextAlignment:location:options:"),
-        2,
+        1,
         location,
         options,
     )

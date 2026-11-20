@@ -616,13 +616,30 @@ fn refresh_values(state: &mut AppState) {
                     false,
                 );
             }
+            let sensor_tab = tab_stop_for(
+                &std::iter::once("Average".to_string())
+                    .chain(reading.sensors.iter().map(|sensor| match display_key(sensor) {
+                        Some(key) => format!("{key}  {}", sensor.label),
+                        None => sensor.label.clone(),
+                    }))
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(item) = state.live_items.get(&category_tag(category, None)).copied() {
+                set_row_title(
+                    item,
+                    "Average",
+                    if reading.average.has_data() { &reading.average.text } else { "No data" },
+                    sensor_tab,
+                    true,
+                );
+            }
             for (index, sensor) in reading.sensors.iter().enumerate() {
                 if let Some(item) = state.live_items.get(&category_tag(category, Some(index))).copied() {
                     let left = match display_key(sensor) {
                         Some(key) => format!("{key}  {}", sensor.label),
                         None => sensor.label.clone(),
                     };
-                    set_row_title(item, &left, &sensor.reading.text, 190.0, true);
+                    set_row_title(item, &left, &sensor.reading.text, sensor_tab, true);
                 }
             }
         }
@@ -970,9 +987,36 @@ pub fn dump_menu() -> String {
                     name, sub_size.width, sub_size.height
                 ));
             }
+            out.push_str("\n## Row style\n");
+            out.push_str(&row_style_report(96.0));
             out.push_str("\n## Dropdown\n");
             walk(menu, 1, &mut out);
         });
+        out
+    }
+}
+
+fn row_style_report(tab_stop: f64) -> String {
+    unsafe {
+        let mut out = String::new();
+        let tab = objc::send_tab(tab_stop);
+        let location = objc::send_float_result(tab, "location");
+        let alignment = objc::send_int_result(tab, "alignment");
+        out.push_str(&format!(
+            "   tab stop: location={location:.1} pt alignment={alignment} (1 = right)\n"
+        ));
+        let row = Attributed::row("Temperature", "45.7 °C", tab_stop, true);
+        let size = objc::send_size(row, "size");
+        out.push_str(&format!(
+            "   row \"Temperature<TAB>45.7 °C\" measures {:.1} pt wide\n",
+            size.width
+        ));
+        let wide = Attributed::row("Temperature", "45.7 °C", 200.0, true);
+        let wide_size = objc::send_size(wide, "size");
+        out.push_str(&format!(
+            "   same row with a 200 pt tab stop measures {:.1} pt — the tab stop is applied only if this grows\n",
+            wide_size.width
+        ));
         out
     }
 }
