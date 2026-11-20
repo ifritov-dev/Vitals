@@ -24,12 +24,11 @@ struct AppState {
     store: SensorStore,
     prefs: Prefs,
     controller: Obj,
-    status_items: Vec<Obj>,
+    status_item: Obj,
     /// Tag -> menu item, so open menus can be updated in place.
     live_items: HashMap<isize, Obj>,
     open_menu: Obj,
     tracking_timer: Obj,
-    last_refresh: Instant,
     last_signature: String,
     /// Value column of the dropdown, fixed while the menu is open so a value
     /// that grows between ticks moves nothing.
@@ -80,15 +79,16 @@ pub fn run() {
         // LSUIElement is in Info.plist; accessory keeps it true from a terminal.
         objc::send_void_int(app, "setActivationPolicy:", 1);
         let controller = make_controller();
-        let mut store = SensorStore::new();
-        store.refresh();
+        // The poller owns the SMC connection; opening a second one here would
+        // only block the launch for a reading that arrives a moment later.
+        let store = SensorStore::for_ui();
         let prefs = Prefs::load();
 
         *STATE.lock().unwrap() = Some(AppState {
             store,
             prefs,
             controller,
-            status_items: Vec::new(),
+            status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
@@ -101,11 +101,16 @@ pub fn run() {
             collect_timer: std::ptr::null_mut(),
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
-            last_refresh: Instant::now(),
             last_signature: String::new(),
         });
 
-        with_state(|state| rebuild_status_items(state));
+        with_state(|state| create_status_item(state));
+        with_state(|state| {
+            if let Some(poller) = state.poller.as_ref() {
+                poller.request(true, &[]);
+                schedule_collect(state);
+            }
+        });
 
         with_state(schedule_ticks);
         let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
@@ -155,10 +160,6 @@ unsafe extern "C" fn tick_imp(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| tick(state));
 }
 
-extern "C" fn tick_source(_context: *mut std::ffi::c_void) {
-    with_state(|state| tick(state));
-}
-
 unsafe extern "C" fn menu_needs_update(_this: Obj, _cmd: Sel, menu: Obj) {
     with_state(|state| match state.submenus.get(&(menu as usize)).copied() {
         Some(category) => {
@@ -201,6 +202,7 @@ unsafe extern "C" fn menu_did_close(_this: Obj, _cmd: Sel, _menu: Obj) {
     with_state(|state| {
         if !state.tracking_timer.is_null() {
             objc::send_void(state.tracking_timer, "invalidate");
+            objc::release(state.tracking_timer);
             state.tracking_timer = std::ptr::null_mut();
         }
         state.open_menu = std::ptr::null_mut();
@@ -242,11 +244,14 @@ unsafe extern "C" fn demo_close(_this: Obj, _cmd: Sel, _timer: Obj) {
 
 unsafe extern "C" fn demo_open(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| {
-        if let Some(item) = state.status_items.first().copied() {
-            if let Some(button) = button_of(item) {
-                eprintln!("demo: clicking status item");
-                objc::send_void_obj(button, "performClick:", std::ptr::null_mut());
-                eprintln!("demo: menu closed again");
+        {
+            let item = state.status_item;
+            if !item.is_null() {
+                if let Some(button) = button_of(item) {
+                    eprintln!("demo: clicking status item");
+                    objc::send_void_obj(button, "performClick:", std::ptr::null_mut());
+                    eprintln!("demo: menu closed again");
+                }
             }
         }
     });
@@ -294,23 +299,18 @@ fn signature(prefs: &Prefs) -> String {
     )
 }
 
-fn rebuild_status_items(state: &mut AppState) {
+/// Creates the single status item and its menu. There is one slot by design,
+/// so nothing here needs rebuilding; only the title changes.
+fn create_status_item(state: &mut AppState) {
     unsafe {
-        for item in state.status_items.drain(..) {
-            let bar = objc::send(objc::class("NSStatusBar"), "systemStatusBar");
-            objc::send_void_obj(bar, "removeStatusItem:", item);
-            objc::release(item);
-        }
         let bar = objc::send(objc::class("NSStatusBar"), "systemStatusBar");
-        let categories = state.prefs.ordered_menu_bar();
-
         // +statusItemWithLength: hands back an autoreleased item, and the
         // pointer we keep has to outlive the pool that created it.
         let item = objc::retain(objc::send_float(bar, "statusItemWithLength:", -1.0));
         let menu = make_menu(state.controller);
         objc::send_void_obj(item, "setMenu:", menu);
-        state.status_items.push(item);
-        let _ = categories;
+        objc::release(menu);
+        state.status_item = item;
         state.last_signature = signature(&state.prefs);
         state.last_title.clear();
         update_status_titles(state);
@@ -344,14 +344,15 @@ fn update_status_titles(state: &mut AppState) {
                 format!("{}={};", category.key(), value.compact)
             })
             .collect::<String>();
-        if stated == state.last_title && !state.status_items.is_empty() {
+        if stated == state.last_title && !state.status_item.is_null() {
             return;
         }
         state.last_title = stated;
         {
-            let Some(item) = state.status_items.first() else {
+            let item = &state.status_item;
+            if item.is_null() {
                 return;
-            };
+            }
             let Some(button) = button_of(*item) else { return };
             let mut title = Attributed::new();
             for (index, category) in categories.iter().enumerate() {
@@ -413,32 +414,38 @@ fn tick(state: &mut AppState) {
         }
         None => {
             state.store.refresh();
-            show_latest(state);
+            show_latest(state, true);
         }
     }
-    state.last_refresh = Instant::now();
 }
 
 /// Picks up a snapshot the previous tick asked for.
 unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| {
-        state.collect_timer = std::ptr::null_mut();
+        if !state.collect_timer.is_null() {
+            objc::release(state.collect_timer);
+            state.collect_timer = std::ptr::null_mut();
+        }
+        let mut fresh = false;
         if let Some(poller) = state.poller.as_ref() {
             if let Some(snapshot) = poller.take_latest() {
                 state.store.apply(snapshot);
+                fresh = true;
             }
         }
-        show_latest(state);
+        show_latest(state, fresh);
     });
 }
 
-fn show_latest(state: &mut AppState) {
+fn show_latest(state: &mut AppState, fresh: bool) {
     if signature(&state.prefs) != state.last_signature {
-        rebuild_status_items(state);
-        return;
+        state.last_signature = signature(&state.prefs);
+        state.last_title.clear();
     }
     update_status_titles(state);
-    if !state.open_menu.is_null() {
+    // Only rows that show a changed reading are worth rebuilding; while a menu
+    // is open this runs off a 0.4 s timer, most of which bring no new sample.
+    if fresh && !state.open_menu.is_null() {
         refresh_values(state);
     }
 }
@@ -448,6 +455,8 @@ fn schedule_collect(state: &mut AppState) {
     unsafe {
         if !state.collect_timer.is_null() {
             objc::send_void(state.collect_timer, "invalidate");
+            objc::release(state.collect_timer);
+            state.collect_timer = std::ptr::null_mut();
         }
         let timer = objc::send_timer(
             objc::class("NSTimer"),
@@ -551,8 +560,6 @@ fn column_right_with(labels: &[String], values: &[String], extra: f64) -> f64 {
 }
 
 const COLUMN_GUTTER: f64 = 22.0;
-/// Room the leading category icon takes in the dropdown's label column.
-const ICON_WIDTH: f64 = 20.0;
 /// Square an icon is drawn into.
 const ICON_BOX: f64 = 14.0;
 /// Icon size in the menu bar, where the text is 13 pt.
@@ -560,32 +567,6 @@ const STATUS_ICON_SIZE: f64 = 13.0;
 /// Where every category name starts when the row has an icon.
 const ICON_SLOT: f64 = 22.0;
 
-/// Narrowest space the menu font will draw, and how many of them carry a row
-/// from its icon's advance to the icon column.
-///
-/// Only real characters move the text: a tab stop placed after an attachment
-/// is ignored and so is kerning, so the gap has to be a counted run of the
-/// narrowest space available. A hair space is about a third of a point, which
-/// lands the name within a pixel of the column.
-fn icon_pad(advance: f64) -> (char, usize) {
-    unsafe {
-        let font = objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0);
-        let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
-        objc::send_void_obj_obj(attributes, "setObject:forKey:", font, objc::nsstring("NSFont"));
-        let mut best = (' ', text_width(objc::nsstring(" "), attributes));
-        for candidate in ['\u{200A}', '\u{2009}'] {
-            let width = text_width(objc::nsstring(&candidate.to_string()), attributes);
-            if width > 0.01 && width < best.1 {
-                best = (candidate, width);
-            }
-        }
-        if best.1 <= 0.0 {
-            return (' ', 0);
-        }
-        let count = ((ICON_SLOT - advance) / best.1).round().max(0.0) as usize;
-        (best.0, count)
-    }
-}
 
 /// Values are drawn in the monospaced-digit font, so they have to be measured
 /// in it too; the menu font is narrower and would under-reserve the column.
@@ -618,6 +599,7 @@ unsafe fn text_width(text: Obj, attributes: Obj) -> f64 {
 }
 
 fn populate(state: &mut AppState, menu: Obj) {
+    let _pool = objc::AutoreleasePool::new();
     unsafe {
         objc::send_void(menu, "removeAllItems");
         state.live_items.clear();
@@ -642,20 +624,13 @@ fn populate(state: &mut AppState, menu: Obj) {
                 }
             })
             .collect();
-        state.row_tab = column_right_with(&labels, &values, ICON_WIDTH);
+        state.row_tab = column_right_with(&labels, &values, ICON_SLOT);
         let row_tab = state.row_tab;
 
         for category in ALL_CATEGORIES {
             let reading = state.store.get(category).clone();
             let item = menu_item(category.title(), "", 0);
             let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
-            set_row_title(
-                item,
-                category.title(),
-                if value.has_data() { &value.text } else { "No data" },
-                row_tab,
-                false,
-            );
             set_row_title_with_symbol(
                 item,
                 Some(category.icon()),
@@ -675,8 +650,10 @@ fn populate(state: &mut AppState, menu: Obj) {
             objc::send_void_obj(submenu, "setDelegate:", state.controller);
             state.submenus.insert(submenu as usize, category);
             objc::send_void_obj(item, "setSubmenu:", submenu);
+            objc::release(submenu);
             objc::send_void_int(item, "setTag:", row_tag(category));
             objc::send_void_obj(menu, "addItem:", item);
+            objc::release(item);
             state.live_items.insert(row_tag(category), item);
         }
 
@@ -698,9 +675,12 @@ fn populate(state: &mut AppState, menu: Obj) {
             let on = (state.prefs.interval.round() as isize) == seconds;
             objc::send_void_int(item, "setState:", if on { 1 } else { 0 });
             objc::send_void_obj(interval_menu, "addItem:", item);
+            objc::release(item);
         }
         objc::send_void_obj(interval_item, "setSubmenu:", interval_menu);
+        objc::release(interval_menu);
         objc::send_void_obj(menu, "addItem:", interval_item);
+        objc::release(interval_item);
 
         let login_item = action_item("Start at Login", state.controller, TAG_LOGIN);
         objc::send_void_int(
@@ -709,16 +689,19 @@ fn populate(state: &mut AppState, menu: Obj) {
             if crate::login::enabled() { 1 } else { 0 },
         );
         objc::send_void_obj(menu, "addItem:", login_item);
+        objc::release(login_item);
         state.login_item = login_item;
 
         objc::send_void_obj(menu, "addItem:", objc::send(objc::class("NSMenuItem"), "separatorItem"));
         let quit = action_item("Quit Vitals", state.controller, TAG_QUIT);
         objc::send_void_obj(quit, "setKeyEquivalent:", objc::nsstring("q"));
         objc::send_void_obj(menu, "addItem:", quit);
+        objc::release(quit);
     }
 }
 
 fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading: &CategoryReading) {
+    let _pool = objc::AutoreleasePool::new();
     unsafe {
         objc::send_void(menu, "removeAllItems");
         let first_tag = category_tag(category, None) - 1;
@@ -758,6 +741,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
             if shown && active.is_none() { 1 } else { 0 },
         );
         objc::send_void_obj(menu, "addItem:", average);
+        objc::release(average);
         state.live_items.insert(category_tag(category, None), average);
 
         if reading.sensors.is_empty() {
@@ -765,6 +749,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
             let none = menu_item("No data", "", 0);
             objc::send_void_int(none, "setEnabled:", 0);
             objc::send_void_obj(menu, "addItem:", none);
+            objc::release(none);
             return;
         }
 
@@ -780,6 +765,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
             let on = shown && active.as_deref() == Some(sensor.id.as_str());
             objc::send_void_int(item, "setState:", if on { 1 } else { 0 });
             objc::send_void_obj(menu, "addItem:", item);
+            objc::release(item);
             state.live_items.insert(tag, item);
         }
     }
@@ -787,6 +773,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
 
 /// Rewrites the value columns of the menu that is currently open.
 fn refresh_values(state: &mut AppState) {
+    let _pool = objc::AutoreleasePool::new();
     unsafe {
         // The first open can land before the first poll, when every value is
         // still a placeholder and the column the menu was built with is too
@@ -809,7 +796,7 @@ fn refresh_values(state: &mut AppState) {
                 }
             })
             .collect();
-        let needed = column_right_with(&labels, &values, ICON_WIDTH);
+        let needed = column_right_with(&labels, &values, ICON_SLOT);
         if needed > state.row_tab {
             state.row_tab = needed;
         }
@@ -820,13 +807,6 @@ fn refresh_values(state: &mut AppState) {
                 continue;
             };
             let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
-            set_row_title(
-                item,
-                category.title(),
-                if value.has_data() { &value.text } else { "No data" },
-                row_tab,
-                false,
-            );
             set_row_title_with_symbol(
                 item,
                 Some(category.icon()),
@@ -906,11 +886,9 @@ fn dispatch(state: &mut AppState, tag: isize) {
                 .map(|sensor| sensor.id.clone())
         };
         state.prefs.toggle_selection(category, selection.as_deref());
+        state.last_title.clear();
         refresh_values(state);
         update_status_titles(state);
-        if signature(&state.prefs) != state.last_signature {
-            rebuild_status_items(state);
-        }
         return;
     }
     if tag == 0 {
@@ -941,11 +919,8 @@ fn dispatch(state: &mut AppState, tag: isize) {
         }
         _ => {}
     }
-    if signature(&state.prefs) != state.last_signature {
-        rebuild_status_items(state);
-    } else {
-        update_status_titles(state);
-    }
+    state.last_title.clear();
+    update_status_titles(state);
 }
 
 // MARK: - Building attributed strings
@@ -1062,9 +1037,13 @@ impl Attributed {
             let paragraph = objc::send(objc::alloc("NSMutableParagraphStyle"), "init");
             let tabs = objc::send(objc::class("NSMutableArray"), "array");
             if icon.is_some() {
-                objc::send_void_obj(tabs, "addObject:", objc::send_tab(ICON_SLOT));
+                let tab = objc::send_tab(ICON_SLOT);
+                objc::send_void_obj(tabs, "addObject:", tab);
+                objc::release(tab);
             }
-            objc::send_void_obj(tabs, "addObject:", objc::send_tab(value_stop));
+            let tab = objc::send_tab(value_stop);
+            objc::send_void_obj(tabs, "addObject:", tab);
+            objc::release(tab);
             objc::send_void_obj(paragraph, "setTabStops:", tabs);
             objc::send_void_float(paragraph, "setDefaultTabInterval:", value_stop);
 
@@ -1158,7 +1137,7 @@ pub fn dump_menu() -> String {
             store,
             prefs,
             controller,
-            status_items: Vec::new(),
+            status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
@@ -1171,7 +1150,6 @@ pub fn dump_menu() -> String {
             collect_timer: std::ptr::null_mut(),
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
-            last_refresh: Instant::now(),
             last_signature: String::new(),
         });
 
@@ -1225,7 +1203,7 @@ pub fn dump_menu() -> String {
                 );
                 let row_width = objc::send_size(row, "size").width;
                 let name_index = usize::from(symbol.is_some());
-                let name_x = unsafe { name_position(row, name_index) };
+                let name_x = name_position(row, name_index);
                 objc::release(row);
                 out.push_str(&format!(
                     "   {:<12} name at {:>5.1}, label ends {:>6.1}, value starts {:>6.1}, gap {:>5.1}, ends {:>6.1}, row {:>6.1}\n",
@@ -1300,6 +1278,7 @@ fn row_style_report(tab_stop: f64) -> String {
             "   same row with a 200 pt tab stop measures {:.1} pt — the tab stop is applied only if this grows\n",
             wide_size.width
         ));
+        objc::release(tab);
         out
     }
 }
@@ -1348,7 +1327,7 @@ pub fn render_rows(path: &str) {
             store,
             prefs,
             controller,
-            status_items: Vec::new(),
+            status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
@@ -1361,7 +1340,6 @@ pub fn render_rows(path: &str) {
             collect_timer: std::ptr::null_mut(),
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
-            last_refresh: Instant::now(),
             last_signature: String::new(),
         });
         with_state(|state| {
@@ -1443,8 +1421,10 @@ pub fn render_rows(path: &str) {
 fn fill_all_submenus(state: &mut AppState) {
     unsafe {
         let categories: Vec<Category> = ALL_CATEGORIES.to_vec();
-        let menu_bar = state.status_items.first().copied();
-        let Some(item) = menu_bar else { return };
+        let item = state.status_item;
+        if item.is_null() {
+            return;
+        }
         let menu = objc::send(item, "menu");
         if menu.is_null() {
             return;
@@ -1481,7 +1461,7 @@ pub fn bench_menu() -> String {
             store,
             prefs,
             controller,
-            status_items: Vec::new(),
+            status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
@@ -1494,7 +1474,6 @@ pub fn bench_menu() -> String {
             collect_timer: std::ptr::null_mut(),
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
-            last_refresh: Instant::now(),
             last_signature: String::new(),
         });
         with_state(|state| {

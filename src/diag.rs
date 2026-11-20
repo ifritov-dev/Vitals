@@ -3,7 +3,7 @@
 
 use std::ffi::CStr;
 
-use crate::model::{Category, ALL_CATEGORIES};
+use crate::model::ALL_CATEGORIES;
 use crate::prefs::Prefs;
 use crate::store::SensorStore;
 
@@ -144,8 +144,4 @@ pub fn selection_summary(prefs: &Prefs) -> String {
     } else {
         chosen.join(", ")
     }
-}
-
-pub fn category_letter(category: Category) -> &'static str {
-    category.title()
 }

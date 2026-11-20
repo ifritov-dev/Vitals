@@ -230,11 +230,6 @@ impl SmcService {
         Some(output.bytes)
     }
 
-    /// Re-reads every cached key: key -> value.
-    pub fn read_values(&self) -> Vec<(String, f64)> {
-        self.read_values_where(&|_| true)
-    }
-
     /// Reads the keys a filter accepts. Each key is two calls into the driver,
     /// so reading only the categories that are on screen is most of the work
     /// saved on an idle machine.

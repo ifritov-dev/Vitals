@@ -58,6 +58,22 @@ pub fn run() -> Outcome {
     out.close("ui8", decode("ui8", &pad(&[0xFF]), 1), 255.0, 1e-6);
     out.close("si8", decode("si8", &pad(&[0xFF]), 1), -1.0, 1e-6);
     out.close("si16", decode("si16", &pad(&[0xFF, 0xFF]), 2), -1.0, 1e-6);
+
+    // Bytes as the SMC actually returns them for a few well-known keys, so the
+    // type table is checked against the driver and not only against itself.
+    out.close("sp5a ratio", decode("sp5a", &pad(&[0x09, 0x67]), 2), 2407.0 / 1024.0, 1e-6);
+    out.close("fpe2 fan 2407", decode("fpe2", &pad(&[0x25, 0x9C]), 2), 2407.0, 1e-6);
+    out.close("fpe2 open fan", decode("fpe2", &pad(&[0x00, 0x00]), 2), 0.0, 1e-6);
+    out.close("flt voltage", decode("flt ", &pad(&[0x9A, 0x99, 0xA9, 0x42]), 4), 84.8, 1e-3);
+    out.close("ioft zero", decode("ioft", &pad(&[0u8; 8]), 8), 0.0, 1e-6);
+    out.check(
+        "unknown type is refused",
+        decode("zzzz", &pad(&[0x01, 0x02]), 2).is_none(),
+    );
+    out.check(
+        "a two-byte type with one byte is refused",
+        decode("fpe2", &pad(&[0x25]), 1).is_none(),
+    );
     out.close(
         "ui32 key count",
         decode("ui32", &pad(&[0x00, 0x00, 0x08, 0x85]), 4),

@@ -1,157 +1,9 @@
-//! Builds every category: SMC-derived ones and the kernel-counter ones.
+//! Memory, processor, system, network and storage from mach and sysctl.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_void, CStr};
 use std::time::Instant;
 
 use crate::model::{format, Category, CategoryReading, Reading, Sensor};
-
-// MARK: - SMC-backed categories
-
-pub fn temperature(values: &[(String, f64)]) -> CategoryReading {
-    let mut sensors: Vec<Sensor> = values
-        .iter()
-        .filter(|(key, value)| {
-            key.starts_with('T') && value.is_finite() && *value > 1.0 && *value < 130.0
-        })
-        .map(|(key, value)| Sensor {
-            id: key.clone(),
-            key: key.clone(),
-            label: thermal_label(key).to_string(),
-            reading: format::temperature(*value),
-        })
-        .collect();
-    sensors.sort_by(|a, b| a.key.cmp(&b.key));
-    if sensors.is_empty() {
-        return CategoryReading::empty(Category::Temperature);
-    }
-    let mean = sensors.iter().map(|s| s.reading.value).sum::<f64>() / sensors.len() as f64;
-    CategoryReading {
-        category: Category::Temperature,
-        sensors,
-        average: format::temperature(mean),
-    }
-}
-
-pub fn voltage(values: &[(String, f64)]) -> CategoryReading {
-    let mut sensors: Vec<Sensor> = values
-        .iter()
-        .filter(|(key, value)| {
-            key.starts_with('V') && value.is_finite() && *value > 0.05 && *value < 60.0
-        })
-        .map(|(key, value)| Sensor {
-            id: key.clone(),
-            key: key.clone(),
-            label: voltage_label(key).to_string(),
-            reading: format::voltage(*value),
-        })
-        .collect();
-    sensors.sort_by(|a, b| a.key.cmp(&b.key));
-    if sensors.is_empty() {
-        return CategoryReading::empty(Category::Voltage);
-    }
-    let mean = sensors.iter().map(|s| s.reading.value).sum::<f64>() / sensors.len() as f64;
-    CategoryReading {
-        category: Category::Voltage,
-        sensors,
-        average: format::voltage(mean),
-    }
-}
-
-pub fn fan(values: &[(String, f64)]) -> CategoryReading {
-    let mut sensors: Vec<Sensor> = values
-        .iter()
-        .filter(|(key, value)| {
-            let b = key.as_bytes();
-            b.len() == 4
-                && b[0] == b'F'
-                && b[1].is_ascii_digit()
-                && b[2] == b'A'
-                && b[3] == b'c'
-                && value.is_finite()
-                && *value >= 0.0
-                && *value < 12000.0
-        })
-        .map(|(key, value)| Sensor {
-            id: key.clone(),
-            key: key.clone(),
-            label: format!("Fan {}", &key[1..2]),
-            reading: format::rpm(*value),
-        })
-        .collect();
-    sensors.sort_by(|a, b| a.key.cmp(&b.key));
-    if sensors.is_empty() {
-        return CategoryReading::empty(Category::Fan);
-    }
-    let mean = sensors.iter().map(|s| s.reading.value).sum::<f64>() / sensors.len() as f64;
-    CategoryReading {
-        category: Category::Fan,
-        sensors,
-        average: format::rpm(mean),
-    }
-}
-
-fn thermal_label(key: &str) -> &'static str {
-    match key {
-        "TB0T" | "TB1T" | "TB2T" => return "Battery",
-        "TC0P" | "TC0E" | "TC0D" => return "CPU Proximity",
-        "TCMb" | "TCMz" => return "SoC",
-        "TW0P" => return "Wi-Fi",
-        "TPMP" => return "Power Management",
-        "TS0P" | "TS1P" => return "SSD",
-        _ => {}
-    }
-    let b = key.as_bytes();
-    if b.len() != 4 || b[0] != b'T' {
-        return "Thermal sensor";
-    }
-    match b[1] {
-        b'C' => match b[2] {
-            b'1' => "CPU E-Core",
-            b'2' | b'3' => "CPU P-Core",
-            _ => "CPU Core",
-        },
-        b'P' => {
-            if b[2] == b'D' {
-                "GPU Core"
-            } else {
-                "CPU Core"
-            }
-        }
-        b'p' => "CPU P-Core",
-        b'd' => "SoC Cluster",
-        b'e' | b'g' | b'G' => "GPU Cluster",
-        b'h' | b'm' | b'M' => "Memory",
-        b'a' => "Ambient",
-        b's' => "Sensor",
-        b'v' | b'V' => "Media Engine",
-        b'z' => "Unused",
-        _ => "Thermal sensor",
-    }
-}
-
-fn voltage_label(key: &str) -> &'static str {
-    match key {
-        "Vb0f" | "Vb1f" => return "DC-In",
-        "VDMA" | "VDMM" => return "DRAM",
-        "VMVC" => return "Memory Controller",
-        "VSVR" => return "SoC Rail",
-        _ => {}
-    }
-    let b = key.as_bytes();
-    if b.len() != 4 {
-        return "Voltage rail";
-    }
-    match b[1] {
-        b'P' => "Power Rail",
-        b'R' => "SoC Rail",
-        b'C' => "CPU Rail",
-        b'D' => "Voltage Rail",
-        b'S' => "Sensor Rail",
-        _ => "Voltage rail",
-    }
-}
-
-// MARK: - Kernel counters
 
 const HOST_VM_INFO64: i32 = 4;
 const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
@@ -215,12 +67,6 @@ extern "C" {
     fn mach_host_self() -> u32;
     static mach_task_self_: u32;
 
-    fn IOPSCopyPowerSourcesInfo() -> *mut c_void;
-    fn IOPSCopyPowerSourcesList(blob: *mut c_void) -> *mut c_void;
-    fn IOPSGetPowerSourceDescription(blob: *mut c_void, source: *mut c_void) -> *mut c_void;
-    fn CFArrayGetCount(array: *mut c_void) -> isize;
-    fn CFArrayGetValueAtIndex(array: *mut c_void, index: isize) -> *mut c_void;
-    fn CFRelease(cf: *mut c_void);
 }
 
 pub struct SystemSensors {
@@ -318,7 +164,6 @@ impl SystemSensors {
             },
         ];
         CategoryReading {
-            category: Category::Memory,
             sensors,
             average: format::percent(used_percent),
         }
@@ -397,7 +242,6 @@ impl SystemSensors {
             });
         }
         CategoryReading {
-            category: Category::Processor,
             sensors,
             average: format::percent(total_load),
         }
@@ -430,7 +274,6 @@ impl SystemSensors {
             },
         ];
         CategoryReading {
-            category: Category::System,
             sensors,
             average: format::load(loads[0]),
         }
@@ -480,7 +323,6 @@ impl SystemSensors {
             ),
         );
         CategoryReading {
-            category: Category::Network,
             sensors,
             average,
         }
@@ -523,122 +365,8 @@ impl SystemSensors {
             },
         ];
         CategoryReading {
-            category: Category::Storage,
             sensors,
             average: format::percent(used_percent),
-        }
-    }
-
-    pub fn battery(&self, smc: &[(String, f64)]) -> CategoryReading {
-        let lookup = |key: &str| smc.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
-
-        unsafe {
-            let blob = IOPSCopyPowerSourcesInfo();
-            if blob.is_null() {
-                return CategoryReading::empty(Category::Battery);
-            }
-            let list = IOPSCopyPowerSourcesList(blob);
-            if list.is_null() {
-                CFRelease(blob);
-                return CategoryReading::empty(Category::Battery);
-            }
-            let count = CFArrayGetCount(list);
-            if count == 0 {
-                CFRelease(list);
-                CFRelease(blob);
-                return CategoryReading::empty(Category::Battery);
-            }
-            let source = CFArrayGetValueAtIndex(list, 0);
-            let description = IOPSGetPowerSourceDescription(blob, source);
-            if description.is_null() {
-                CFRelease(list);
-                CFRelease(blob);
-                return CategoryReading::empty(Category::Battery);
-            }
-
-            let current_capacity = dict_int(description, "Current Capacity").unwrap_or(0);
-            let max_capacity = dict_int(description, "Max Capacity").unwrap_or(100);
-            let charging = dict_bool(description, "Is Charging").unwrap_or(false);
-            let state = dict_string(description, "Power Source State").unwrap_or_default();
-            let on_ac = state == "AC Power";
-            let charge_percent = if max_capacity > 0 {
-                current_capacity as f64 / max_capacity as f64 * 100.0
-            } else {
-                current_capacity as f64
-            };
-
-            let mut sensors = vec![Sensor {
-                id: "battery.charge".into(),
-                key: "charge".into(),
-                label: "Charge".into(),
-                reading: format::percent(charge_percent),
-            }];
-
-            let voltage = lookup("B0AV").map(|mv| mv / 1000.0);
-            let amperage = lookup("B0AC")
-                .map(|ma| ma / 1000.0)
-                .or_else(|| dict_int(description, "Current").map(|amps| amps as f64));
-            if let (Some(volts), Some(amps)) = (voltage, amperage) {
-                sensors.push(Sensor {
-                    id: "battery.power".into(),
-                    key: "B0AV×B0AC".into(),
-                    label: "Power".into(),
-                    reading: format::watts(volts * amps),
-                });
-                sensors.push(Sensor {
-                    id: "battery.voltage".into(),
-                    key: "B0AV".into(),
-                    label: "Voltage".into(),
-                    reading: format::voltage(volts),
-                });
-                sensors.push(Sensor {
-                    id: "battery.current".into(),
-                    key: "B0AC".into(),
-                    label: "Current".into(),
-                    reading: format::amperes(amps),
-                });
-            }
-
-            let state_text = if charging {
-                "Charging"
-            } else if on_ac {
-                "AC Power"
-            } else {
-                "On Battery"
-            };
-            sensors.push(Sensor {
-                id: "battery.state".into(),
-                key: "state".into(),
-                label: "State".into(),
-                reading: Reading::new(
-                    if on_ac { 1.0 } else { 0.0 },
-                    state_text.to_string(),
-                    state_text.to_string(),
-                ),
-            });
-
-            if !on_ac {
-                if let Some(minutes) = dict_int(description, "Time to Empty") {
-                    if minutes > 0 {
-                        let text = format!("{}:{:02}", minutes / 60, minutes % 60);
-                        sensors.push(Sensor {
-                            id: "battery.remaining".into(),
-                            key: "time".into(),
-                            label: "Remaining".into(),
-                            reading: Reading::new(minutes as f64, text.clone(), text),
-                        });
-                    }
-                }
-            }
-
-            CFRelease(list);
-            CFRelease(blob);
-
-            CategoryReading {
-                category: Category::Battery,
-                sensors,
-                average: format::percent(charge_percent),
-            }
         }
     }
 }
@@ -677,8 +405,10 @@ fn interface_counters() -> Option<(u64, u64)> {
         if !address.is_null() && unsafe { (*address).sa_family as i32 } == libc::AF_LINK
             && !entry.ifa_data.is_null()
         {
+            // Only real interfaces: utun, bridge, awdl and friends would count
+            // the same traffic twice.
             let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy().into_owned();
-            if !name.starts_with("lo") {
+            if name.starts_with("en") {
                 let data = unsafe { &*(entry.ifa_data as *const IfDataHead) };
                 received = received.wrapping_add(data.ibytes as u64);
                 sent = sent.wrapping_add(data.obytes as u64);
@@ -688,41 +418,4 @@ fn interface_counters() -> Option<(u64, u64)> {
     }
     unsafe { libc::freeifaddrs(head) };
     Some((received, sent))
-}
-
-unsafe fn dict_value(dict: *mut c_void, key: &str) -> *mut c_void {
-    // The IOPowerSources description is a CFDictionary; NSString keys are
-    // toll-free bridged, so the objc runtime can build them.
-    let key_obj = crate::objc::nsstring(key);
-    let value = crate::objc::send_obj(dict as crate::objc::Obj, "objectForKey:", key_obj);
-    crate::objc::release(key_obj);
-    value
-}
-
-unsafe fn dict_int(dict: *mut c_void, key: &str) -> Option<isize> {
-    let value = dict_value(dict, key);
-    if value.is_null() {
-        return None;
-    }
-    Some(crate::objc::send_int_result(value as crate::objc::Obj, "integerValue"))
-}
-
-unsafe fn dict_bool(dict: *mut c_void, key: &str) -> Option<bool> {
-    let value = dict_value(dict, key);
-    if value.is_null() {
-        return None;
-    }
-    Some(crate::objc::send_bool_result(value as crate::objc::Obj, "boolValue"))
-}
-
-unsafe fn dict_string(dict: *mut c_void, key: &str) -> Option<String> {
-    let value = dict_value(dict, key);
-    if value.is_null() {
-        return None;
-    }
-    let utf8 = crate::objc::send(value as crate::objc::Obj, "UTF8String") as *const c_char;
-    if utf8.is_null() {
-        return None;
-    }
-    Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
 }

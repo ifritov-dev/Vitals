@@ -43,9 +43,19 @@ unsafe fn ct_font_register(url: Obj) -> bool {
     CTFontManagerRegisterFontsForURL(url, 1, &mut error)
 }
 
-/// The icon font at a size, if it is available.
+/// The icon font at a size, if it is available. Cached: a row build asks for
+/// it once per row and the answer never changes.
 pub fn font(size: f64) -> Option<Obj> {
-    unsafe {
+    thread_local! {
+        static FONTS: std::cell::RefCell<std::collections::HashMap<u64, usize>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = size.to_bits();
+    if let Some(pointer) = FONTS.with(|cache| cache.borrow().get(&key).copied()) {
+        return if pointer == 0 { None } else { Some(pointer as Obj) };
+    }
+    let resolved = unsafe {
+        let mut found = std::ptr::null_mut();
         for name in ["Phosphor", "Phosphor-Regular"] {
             let font = objc::send_obj_float(
                 objc::class("NSFont"),
@@ -54,11 +64,16 @@ pub fn font(size: f64) -> Option<Obj> {
                 size,
             );
             if !font.is_null() {
-                return Some(font);
+                found = font;
+                break;
             }
         }
-        None
-    }
+        found
+    };
+    FONTS.with(|cache| {
+        cache.borrow_mut().insert(key, resolved as usize);
+    });
+    if resolved.is_null() { None } else { Some(resolved) }
 }
 
 impl crate::model::Category {

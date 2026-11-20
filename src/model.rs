@@ -62,20 +62,6 @@ impl Category {
         }
     }
 
-    /// SF Symbol names, most specific first.
-    pub fn symbols(self) -> &'static [&'static str] {
-        match self {
-            Category::Temperature => &["thermometer.medium", "thermometer"],
-            Category::Voltage => &["bolt.fill", "bolt"],
-            Category::Fan => &["fanblades.fill", "fanblades", "wind"],
-            Category::Memory => &["memorychip.fill", "memorychip"],
-            Category::Processor => &["cpu.fill", "cpu"],
-            Category::System => &["gauge.with.dots.needle.50percent", "gauge.medium"],
-            Category::Network => &["network", "globe"],
-            Category::Storage => &["internaldrive.fill", "internaldrive"],
-            Category::Battery => &["battery.100", "battery.75", "bolt.batteryblock"],
-        }
-    }
 }
 
 /// One number ready for display: full text for a menu row and the terse text
@@ -115,15 +101,13 @@ pub struct Sensor {
 
 #[derive(Clone, Debug)]
 pub struct CategoryReading {
-    pub category: Category,
     pub sensors: Vec<Sensor>,
     pub average: Reading,
 }
 
 impl CategoryReading {
-    pub fn empty(category: Category) -> CategoryReading {
+    pub fn empty(_category: Category) -> CategoryReading {
         CategoryReading {
-            category,
             sensors: Vec::new(),
             average: Reading::no_data(),
         }

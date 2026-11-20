@@ -46,6 +46,21 @@ impl SensorStore {
         }
     }
 
+    /// A store with no SMC connection, for the GUI: the readings arrive from
+    /// the polling thread, which owns the driver connection.
+    pub fn for_ui() -> SensorStore {
+        SensorStore {
+            smc: None,
+            system: SystemSensors::new(),
+            snapshot: ALL_CATEGORIES
+                .iter()
+                .map(|c| CategoryReading::empty(*c))
+                .collect(),
+            total_keys: 0,
+            polled_keys: 0,
+        }
+    }
+
     pub fn smc_available(&self) -> bool {
         self.smc.is_some()
     }
@@ -129,7 +144,7 @@ impl SensorStore {
             Category::System => self.system.system_load(),
             Category::Network => self.system.network(),
             Category::Storage => self.system.storage(),
-            Category::Battery => self.system.battery(values),
+            Category::Battery => sensors::battery::battery(values),
         };
         self.snapshot[category.index()] = reading;
     }
@@ -164,9 +179,5 @@ impl SensorStore {
         self.snapshot
             .get(index)
             .unwrap_or_else(|| unreachable!("every category has a slot"))
-    }
-
-    pub fn all(&self) -> &[CategoryReading] {
-        &self.snapshot
     }
 }

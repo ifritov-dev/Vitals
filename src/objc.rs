@@ -17,12 +17,6 @@ pub struct NSSize {
     pub height: f64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct NSPoint {
-    pub x: f64,
-    pub y: f64,
-}
 
 #[link(name = "objc", kind = "dylib")]
 extern "C" {
@@ -31,7 +25,6 @@ extern "C" {
     pub fn objc_allocateClassPair(superclass: Obj, name: *const c_char, extra_bytes: usize) -> Obj;
     pub fn objc_registerClassPair(cls: Obj);
     pub fn class_addMethod(cls: Obj, sel: Sel, imp: *const c_void, types: *const c_char) -> bool;
-    pub fn object_getClass(obj: Obj) -> Obj;
     fn objc_msgSend();
 }
 
@@ -51,7 +44,20 @@ fn cstring(value: &str) -> CString {
 }
 
 pub unsafe fn class(name: &str) -> Obj {
-    objc_getClass(cstring(name).as_ptr())
+    // Hot paths ask for the same handful of classes per row; resolving them
+    // once keeps a CString allocation out of every call.
+    thread_local! {
+        static CLASSES: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(pointer) = CLASSES.with(|cache| cache.borrow().get(name).copied()) {
+        return pointer as Obj;
+    }
+    let resolved = objc_getClass(cstring(name).as_ptr());
+    CLASSES.with(|cache| {
+        cache.borrow_mut().insert(name.to_string(), resolved as usize);
+    });
+    resolved
 }
 
 pub unsafe fn selector(name: &str) -> Sel {
@@ -104,11 +110,6 @@ pub unsafe fn send_void_float(obj: Obj, sel: &str, arg: f64) {
     function(obj, selector(sel), arg)
 }
 
-pub unsafe fn send_void_obj_int(obj: Obj, sel: &str, a: Obj, b: isize) {
-    let function: unsafe extern "C" fn(Obj, Sel, Obj, isize) =
-        transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), a, b)
-}
 
 pub unsafe fn send_int_result(obj: Obj, sel: &str) -> isize {
     let function: unsafe extern "C" fn(Obj, Sel) -> isize = transmute(objc_msgSend as *const ());
@@ -143,9 +144,6 @@ pub unsafe fn nsstring(value: &str) -> Obj {
     )
 }
 
-pub unsafe fn nsnumber_int(value: isize) -> Obj {
-    send_int(class("NSNumber"), "numberWithInteger:", value)
-}
 
 pub fn msg_send_ptr() -> *const () {
     objc_msgSend as *const ()
@@ -161,10 +159,6 @@ pub unsafe fn send_float_obj_result(obj: Obj, sel: &str, arg: Obj) -> f64 {
     function(obj, selector(sel), arg)
 }
 
-pub unsafe fn send_int_obj_result(obj: Obj, sel: &str, arg: Obj) -> isize {
-    let function: unsafe extern "C" fn(Obj, Sel, Obj) -> isize = transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), arg)
-}
 
 /// `-addAttribute:value:range:` (range is an NSRange, two uintptr-sized words).
 pub unsafe fn send_obj_obj(obj: Obj, sel: &str, a: Obj, b: Obj) -> Obj {
@@ -190,6 +184,7 @@ pub unsafe fn send_size_obj(obj: Obj, sel: &str, a: Obj) -> NSSize {
 
 /// `-[NSTextTab initWithTextAlignment:location:options:]`. NSTextAlignmentRight
 /// is 1 — 2 is centre, which staggers the column instead of aligning it.
+/// Returns a +1 tab; the caller releases it once a tab-stop array holds it.
 pub unsafe fn send_tab(location: f64) -> Obj {
     let options = send(class("NSDictionary"), "dictionary");
     let function: unsafe extern "C" fn(Obj, Sel, isize, f64, Obj) -> Obj =
@@ -207,10 +202,6 @@ pub fn system_font_size() -> f64 {
     13.0
 }
 
-pub unsafe fn send_void_two_floats(obj: Obj, sel: &str, a: f64, b: f64) {
-    let function: unsafe extern "C" fn(Obj, Sel, f64, f64) = transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), a, b);
-}
 
 /// `+timerWithTimeInterval:target:selector:userInfo:repeats:`
 type TimerFactory =
@@ -255,47 +246,10 @@ pub unsafe fn send_obj_int_obj(obj: Obj, sel: &str, a: isize, b: Obj) -> Obj {
     function(obj, selector(sel), a, b)
 }
 
-pub unsafe fn send_bool_error(obj: Obj, sel: &str, error: *mut Obj) -> bool {
-    let function: unsafe extern "C" fn(Obj, Sel, *mut Obj) -> bool = transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), error)
-}
 
-pub unsafe fn nsstring_to_string(value: Obj) -> String {
-    if value.is_null() {
-        return String::new();
-    }
-    let utf8 = send(value, "UTF8String") as *const std::ffi::c_char;
-    if utf8.is_null() {
-        return String::new();
-    }
-    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
-}
 
-#[repr(C)]
-pub struct CgRect {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
 
-pub unsafe fn send_void_rect(obj: Obj, sel: &str, rect: &CgRect) {
-    let function: unsafe extern "C" fn(Obj, Sel, *const CgRect) = transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), rect);
-}
 
-pub unsafe fn send_void_rect_rect_int_float(
-    obj: Obj,
-    sel: &str,
-    a: *const CgRect,
-    b: *const CgRect,
-    op: isize,
-    fraction: f64,
-) {
-    let function: unsafe extern "C" fn(Obj, Sel, *const CgRect, *const CgRect, isize, f64) =
-        transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), a, b, op, fraction);
-}
 
 pub unsafe fn send_obj_size_int(obj: Obj, sel: &str, width: f64, height: f64, flag: isize) -> Obj {
     let function: unsafe extern "C" fn(Obj, Sel, f64, f64, isize) -> Obj =
@@ -320,46 +274,43 @@ pub unsafe fn send_int_obj_result2(obj: Obj, sel: &str, arg: usize) -> usize {
     function(obj, selector(sel), arg)
 }
 
-pub unsafe fn bitmap_rep(width: isize, height: isize) -> Obj {
-    let function: unsafe extern "C" fn(
-        Obj,
-        Sel,
-        *mut u8,
-        isize,
-        isize,
-        isize,
-        isize,
-        bool,
-        bool,
-        Obj,
-        isize,
-        isize,
-    ) -> Obj = transmute(objc_msgSend as *const ());
-    function(
-        alloc("NSBitmapImageRep"),
-        selector("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
-        std::ptr::null_mut(),
-        width,
-        height,
-        8,
-        4,
-        true,
-        false,
-        nsstring("NSDeviceRGBColorSpace"),
-        0,
-        0,
-    )
-}
 
-pub unsafe fn graphics_context_for(bitmap: Obj) -> Obj {
-    send_obj(class("NSGraphicsContext"), "graphicsContextWithBitmapImageRep:", bitmap)
-}
 
-pub unsafe fn set_current_graphics_context(context: Obj) {
-    send_void_obj(class("NSGraphicsContext"), "setCurrentContext:", context);
-}
 
 pub unsafe fn send_obj_float(obj: Obj, sel: &str, a: Obj, b: f64) -> Obj {
     let function: unsafe extern "C" fn(Obj, Sel, Obj, f64) -> Obj = transmute(objc_msgSend as *const ());
     function(obj, selector(sel), a, b)
+}
+
+extern "C" {
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
+}
+
+/// Drains the objects the UI builds as it goes. Without a pool of its own a
+/// refresh leaves its autoreleased strings and fonts to the run loop's pool,
+/// which does not drain while a menu is tracking.
+pub struct AutoreleasePool(*mut c_void);
+
+impl AutoreleasePool {
+    pub fn new() -> AutoreleasePool {
+        unsafe { AutoreleasePool(objc_autoreleasePoolPush()) }
+    }
+}
+
+impl Drop for AutoreleasePool {
+    fn drop(&mut self) {
+        unsafe { objc_autoreleasePoolPop(self.0) }
+    }
+}
+
+pub unsafe fn nsstring_to_string(value: Obj) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let utf8 = send(value, "UTF8String") as *const std::ffi::c_char;
+    if utf8.is_null() {
+        return String::new();
+    }
+    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
 }

@@ -119,7 +119,6 @@ impl Prefs {
             let interval = objc::send_float(objc::class("NSNumber"), "numberWithDouble:", self.interval);
             objc::send_void_obj_obj(store, "setObject:forKey:", interval, objc::nsstring(KEY_INTERVAL));
 
-            objc::send_bool_result(store, "synchronize");
         }
     }
 
