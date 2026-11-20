@@ -531,6 +531,9 @@ fn populate(state: &mut AppState, menu: Obj) {
 
 fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading: &CategoryReading) {
     unsafe {
+        // A checkmark means "this row is what the menu bar is showing", so a
+        // category that is not in the menu bar has no checked row at all.
+        let shown = state.prefs.menu_bar.contains(&category);
         let active = state.prefs.selection(category).cloned();
         let labels: Vec<String> = std::iter::once("Average".to_string())
             .chain(reading.sensors.iter().map(|sensor| {
@@ -555,7 +558,11 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
             tab,
             true,
         );
-        objc::send_void_int(average, "setState:", if active.is_none() { 1 } else { 0 });
+        objc::send_void_int(
+            average,
+            "setState:",
+            if shown && active.is_none() { 1 } else { 0 },
+        );
         objc::send_void_obj(menu, "addItem:", average);
         state.live_items.insert(category_tag(category, None), average);
 
@@ -576,7 +583,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
                 None => sensor.label.clone(),
             };
             set_row_title(item, &left, &sensor.reading.text, tab, true);
-            let on = active.as_deref() == Some(sensor.id.as_str());
+            let on = shown && active.as_deref() == Some(sensor.id.as_str());
             objc::send_void_int(item, "setState:", if on { 1 } else { 0 });
             objc::send_void_obj(menu, "addItem:", item);
             state.live_items.insert(tag, item);
