@@ -29,7 +29,7 @@ func continuousSquare(_ rect: CGRect, radius r: CGFloat) -> CGPath {
     path.addLine(to: CGPoint(x: minX + r, y: minY))
     path.addCurve(to: CGPoint(x: minX, y: minY + r),
                   control1: CGPoint(x: minX + r - k * r, y: minY),
-                  control2: CGPoint(x: minX, y: minY - r + k * r))
+                  control2: CGPoint(x: minX, y: minY + r - k * r))
     path.addLine(to: CGPoint(x: minX, y: maxY - r))
     path.addCurve(to: CGPoint(x: minX + r, y: maxY),
                   control1: CGPoint(x: minX, y: maxY - r + k * r),
