@@ -358,3 +358,8 @@ pub unsafe fn graphics_context_for(bitmap: Obj) -> Obj {
 pub unsafe fn set_current_graphics_context(context: Obj) {
     send_void_obj(class("NSGraphicsContext"), "setCurrentContext:", context);
 }
+
+pub unsafe fn send_obj_float(obj: Obj, sel: &str, a: Obj, b: f64) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, f64) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b)
+}

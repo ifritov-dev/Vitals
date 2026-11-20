@@ -20,6 +20,7 @@ app: build
 	@touch dist/.metadata_never_index
 	cp $(RELEASE_BIN) $(BUNDLE)/Contents/MacOS/$(APP_NAME)
 	cp packaging/Info.plist $(BUNDLE)/Contents/Info.plist
+	cp packaging/Phosphor.ttf $(BUNDLE)/Contents/Resources/Phosphor.ttf
 	printf 'APPL????' > $(BUNDLE)/Contents/PkgInfo
 	codesign --force --sign - --timestamp=none $(BUNDLE)
 	@codesign --verify --strict $(BUNDLE) && echo "✔ signed and ready: $(BUNDLE)"

@@ -1,4 +1,5 @@
 mod diag;
+mod icons;
 mod login;
 mod model;
 mod objc;
