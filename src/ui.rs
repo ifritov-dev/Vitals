@@ -35,6 +35,13 @@ struct AppState {
     row_tab: f64,
     /// Same, per category, for each submenu.
     sensor_tabs: [f64; 9],
+    /// Submenu -> category, so a submenu can be filled when it is about to
+    /// open instead of all nine being built with the dropdown.
+    submenus: HashMap<usize, Category>,
+    /// The category whose submenu is on screen, if any.
+    open_submenu: Option<Category>,
+    /// Reads sensors off the main thread; only the GUI runs one.
+    poller: Option<crate::poller::Poller>,
 }
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
@@ -76,6 +83,9 @@ pub fn run() {
             tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
             sensor_tabs: [0.0; 9],
+            submenus: HashMap::new(),
+            open_submenu: None,
+            poller: Some(crate::poller::Poller::start()),
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -144,12 +154,19 @@ extern "C" fn tick_source(_context: *mut std::ffi::c_void) {
 }
 
 unsafe extern "C" fn menu_needs_update(_this: Obj, _cmd: Sel, menu: Obj) {
-    with_state(|state| populate(state, menu));
+    with_state(|state| match state.submenus.get(&(menu as usize)).copied() {
+        Some(category) => {
+            let reading = state.store.get(category).clone();
+            populate_submenu(state, menu, category, &reading);
+        }
+        None => populate(state, menu),
+    });
 }
 
 unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
     with_state(|state| {
         state.open_menu = menu;
+        state.open_submenu = state.submenus.get(&(menu as usize)).copied();
         // A menu tracks in NSEventTrackingRunLoopMode, where the regular
         // ticker does not run; this one keeps the open dropdown live.
         let controller = state.controller;
@@ -175,6 +192,7 @@ unsafe extern "C" fn menu_did_close(_this: Obj, _cmd: Sel, _menu: Obj) {
             state.tracking_timer = std::ptr::null_mut();
         }
         state.open_menu = std::ptr::null_mut();
+        state.open_submenu = None;
         state.live_items.clear();
     });
 }
@@ -355,12 +373,30 @@ fn update_status_titles(state: &mut AppState) {
 
 fn tick(state: &mut AppState) {
     let due = state.last_refresh.elapsed() >= Duration::from_secs_f64(state.prefs.interval);
+    let mut fresh = false;
     if due {
-        state.store.refresh();
+        match state.poller.as_ref() {
+            // The poll itself runs on the worker thread; the tick only asks
+            // for it, so the menu keeps tracking the pointer while it runs.
+            Some(poller) => poller.request(),
+            None => {
+                state.store.refresh();
+                fresh = true;
+            }
+        }
         state.last_refresh = Instant::now();
+    }
+    if let Some(poller) = state.poller.as_ref() {
+        if let Some(snapshot) = poller.take_latest() {
+            state.store.apply(snapshot);
+            fresh = true;
+        }
     }
     if signature(&state.prefs) != state.last_signature {
         rebuild_status_items(state);
+        return;
+    }
+    if !fresh {
         return;
     }
     update_status_titles(state);
@@ -452,6 +488,9 @@ fn populate(state: &mut AppState, menu: Obj) {
     unsafe {
         objc::send_void(menu, "removeAllItems");
         state.live_items.clear();
+        // The submenus are rebuilt with the dropdown, so the mapping from the
+        // previous open's objects is stale from here on.
+        state.submenus.clear();
 
         let labels: Vec<String> = ALL_CATEGORIES
             .iter()
@@ -493,7 +532,10 @@ fn populate(state: &mut AppState, menu: Obj) {
                 objc::nsstring(category.title()),
             );
             objc::send_void_int(submenu, "setAutoenablesItems:", 0);
-            populate_submenu(state, submenu, category, &reading);
+            // Filling a submenu costs a row per sensor it holds, so it happens
+            // when the submenu is opened rather than with the dropdown.
+            objc::send_void_obj(submenu, "setDelegate:", state.controller);
+            state.submenus.insert(submenu as usize, category);
             objc::send_void_obj(item, "setSubmenu:", submenu);
             objc::send_void_int(item, "setTag:", row_tag(category));
             objc::send_void_obj(menu, "addItem:", item);
@@ -531,6 +573,11 @@ fn populate(state: &mut AppState, menu: Obj) {
 
 fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading: &CategoryReading) {
     unsafe {
+        objc::send_void(menu, "removeAllItems");
+        let first_tag = category_tag(category, None) - 1;
+        state
+            .live_items
+            .retain(|tag, _| *tag < first_tag || *tag >= first_tag + 1000);
         // A checkmark means "this row is what the menu bar is showing", so a
         // category that is not in the menu bar has no checked row at all.
         let shown = state.prefs.menu_bar.contains(&category);
@@ -597,34 +644,43 @@ fn refresh_values(state: &mut AppState) {
         let row_tab = state.row_tab;
         for category in ALL_CATEGORIES {
             let reading = state.store.get(category);
-            if let Some(item) = state.live_items.get(&row_tag(category)).copied() {
-                let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
-                set_row_title(
-                    item,
-                    category.title(),
-                    if value.has_data() { &value.text } else { "No data" },
-                    row_tab,
-                    false,
-                );
-            }
-            let sensor_tab = state.sensor_tabs[category.index()];
-            if let Some(item) = state.live_items.get(&category_tag(category, None)).copied() {
-                set_row_title(
-                    item,
-                    "Average",
-                    if reading.average.has_data() { &reading.average.text } else { "No data" },
-                    sensor_tab,
-                    true,
-                );
-            }
-            for (index, sensor) in reading.sensors.iter().enumerate() {
-                if let Some(item) = state.live_items.get(&category_tag(category, Some(index))).copied() {
-                    let left = match display_key(sensor) {
-                        Some(key) => format!("{key}  {}", sensor.label),
-                        None => sensor.label.clone(),
-                    };
-                    set_row_title(item, &left, &sensor.reading.text, sensor_tab, true);
-                }
+            let Some(item) = state.live_items.get(&row_tag(category)).copied() else {
+                continue;
+            };
+            let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
+            set_row_title(
+                item,
+                category.title(),
+                if value.has_data() { &value.text } else { "No data" },
+                row_tab,
+                false,
+            );
+        }
+
+        // The sensor rows of the submenu that is on screen, if one is. The
+        // rest are not built, and rebuilding every row of every category on
+        // each tick is what made the menu stutter while the pointer moved.
+        let Some(category) = state.open_submenu else {
+            return;
+        };
+        let reading = state.store.get(category);
+        let sensor_tab = state.sensor_tabs[category.index()];
+        if let Some(item) = state.live_items.get(&category_tag(category, None)).copied() {
+            set_row_title(
+                item,
+                "Average",
+                if reading.average.has_data() { &reading.average.text } else { "No data" },
+                sensor_tab,
+                true,
+            );
+        }
+        for (index, sensor) in reading.sensors.iter().enumerate() {
+            if let Some(item) = state.live_items.get(&category_tag(category, Some(index))).copied() {
+                let left = match display_key(sensor) {
+                    Some(key) => format!("{key}  {}", sensor.label),
+                    None => sensor.label.clone(),
+                };
+                set_row_title(item, &left, &sensor.reading.text, sensor_tab, true);
             }
         }
     }
@@ -929,6 +985,9 @@ pub fn dump_menu() -> String {
             tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
             sensor_tabs: [0.0; 9],
+            submenus: HashMap::new(),
+            open_submenu: None,
+            poller: None,
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -949,6 +1008,7 @@ pub fn dump_menu() -> String {
                 state.prefs.interval,
                 diag::selection_summary(&state.prefs)
             ));
+            fill_all_submenus(state);
             out.push_str(&format!(
                 "\n## Columns (value column ends at {:.1} pt)\n",
                 state.row_tab
@@ -1092,6 +1152,9 @@ pub fn render_rows(path: &str) {
             tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
             sensor_tabs: [0.0; 9],
+            submenus: HashMap::new(),
+            open_submenu: None,
+            poller: None,
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -1146,5 +1209,108 @@ pub fn render_rows(path: &str) {
             println!("rendered {} rows, width {width:.0} pt, wrote={wrote}", rows.len());
             objc::release(image);
         });
+    }
+}
+
+/// Fills every submenu, for the diagnostics dump. The app itself fills one at
+/// a time, when a submenu is opened.
+fn fill_all_submenus(state: &mut AppState) {
+    unsafe {
+        let categories: Vec<Category> = ALL_CATEGORIES.to_vec();
+        let menu_bar = state.status_items.first().copied();
+        let Some(item) = menu_bar else { return };
+        let menu = objc::send(item, "menu");
+        if menu.is_null() {
+            return;
+        }
+        let items = objc::send(menu, "itemArray");
+        let count = objc::send_int_result(items, "count");
+        for index in 0..count {
+            let row = objc::send_int(items, "objectAtIndex:", index);
+            if row.is_null() {
+                continue;
+            }
+            let submenu = objc::send(row, "submenu");
+            let Some(category) = state.submenus.get(&(submenu as usize)).copied() else {
+                continue;
+            };
+            if !categories.contains(&category) {
+                continue;
+            }
+            let reading = state.store.get(category).clone();
+            populate_submenu(state, submenu, category, &reading);
+        }
+    }
+}
+
+/// Times building the dropdown and one submenu, in milliseconds.
+pub fn bench_menu() -> String {
+    prepare_application();
+    unsafe {
+        let controller = make_controller();
+        let mut store = SensorStore::new();
+        store.refresh();
+        let prefs = Prefs::load();
+        *STATE.lock().unwrap() = Some(AppState {
+            store,
+            prefs,
+            controller,
+            status_items: Vec::new(),
+            live_items: HashMap::new(),
+            open_menu: std::ptr::null_mut(),
+            tracking_timer: std::ptr::null_mut(),
+            row_tab: 0.0,
+            sensor_tabs: [0.0; 9],
+            submenus: HashMap::new(),
+            open_submenu: None,
+            poller: None,
+            last_refresh: Instant::now(),
+            last_signature: String::new(),
+        });
+        with_state(|state| {
+            let menu = make_menu(state.controller);
+            let runs = 10;
+            let start = Instant::now();
+            for _ in 0..runs {
+                populate(state, menu);
+            }
+            let dropdown_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+
+            let submenu = objc::send_obj(
+                objc::alloc("NSMenu"),
+                "initWithTitle:",
+                objc::nsstring("Temperature"),
+            );
+            let reading = state.store.get(Category::Temperature).clone();
+            let start = Instant::now();
+            for _ in 0..runs {
+                populate_submenu(state, submenu, Category::Temperature, &reading);
+            }
+            let submenu_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+
+            let start = Instant::now();
+            for _ in 0..runs {
+                refresh_values(state);
+            }
+            let refresh_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+
+            let start = Instant::now();
+            for _ in 0..5 {
+                state.store.refresh();
+            }
+            let sensor_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+
+            let rows = objc::send_int_result(
+                objc::send(menu, "itemArray"),
+                "count",
+            );
+            format!(
+                "dropdown build: {dropdown_ms:.2} ms ({rows} rows)\n\
+                 temperature submenu build: {submenu_ms:.2} ms ({} rows)\n\
+                 live refresh: {refresh_ms:.2} ms\n\
+                 sensor poll: {sensor_ms:.2} ms\n",
+                reading.sensors.len() + 2
+            )
+        })
     }
 }

@@ -1,6 +1,7 @@
 mod diag;
 mod model;
 mod objc;
+mod poller;
 mod prefs;
 mod selftest;
 mod sensors;
@@ -66,6 +67,12 @@ fn main() {
         ui::prepare_application();
         let text = ui::dump_menu();
         emit(&text, arg_value(&args, "--out"));
+        return;
+    }
+
+    if args.iter().any(|a| a == "--bench-menu") {
+        ui::prepare_application();
+        print!("{}", ui::bench_menu());
         return;
     }
 

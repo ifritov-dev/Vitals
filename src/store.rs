@@ -4,6 +4,14 @@ use crate::model::{Category, CategoryReading, ALL_CATEGORIES};
 use crate::sensors::{self, SystemSensors};
 use crate::smc::SmcService;
 
+/// A finished poll, handed from the polling thread to the UI.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub readings: Vec<CategoryReading>,
+    pub total_keys: usize,
+    pub polled_keys: usize,
+}
+
 pub struct SensorStore {
     smc: Option<SmcService>,
     system: SystemSensors,
@@ -33,6 +41,21 @@ impl SensorStore {
 
     pub fn smc_available(&self) -> bool {
         self.smc.is_some()
+    }
+
+    /// The current readings, to be applied to the UI's own store.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            readings: self.snapshot.clone(),
+            total_keys: self.total_keys,
+            polled_keys: self.polled_keys,
+        }
+    }
+
+    pub fn apply(&mut self, snapshot: Snapshot) {
+        self.snapshot = snapshot.readings;
+        self.total_keys = snapshot.total_keys;
+        self.polled_keys = snapshot.polled_keys;
     }
 
     pub fn refresh(&mut self) {
