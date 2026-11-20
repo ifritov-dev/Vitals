@@ -159,7 +159,7 @@ unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
         );
         let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
         objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, objc::NSEventTrackingRunLoopMode);
-        state.tracking_timer = timer;
+        state.tracking_timer = objc::retain(timer);
     });
 }
 
@@ -263,18 +263,21 @@ fn rebuild_status_items(state: &mut AppState) {
         for item in state.status_items.drain(..) {
             let bar = objc::send(objc::class("NSStatusBar"), "systemStatusBar");
             objc::send_void_obj(bar, "removeStatusItem:", item);
+            objc::release(item);
         }
         let bar = objc::send(objc::class("NSStatusBar"), "systemStatusBar");
         let categories = state.prefs.ordered_menu_bar();
 
+        // +statusItemWithLength: hands back an autoreleased item, and the
+        // pointer we keep has to outlive the pool that created it.
         if state.prefs.compact {
-            let item = objc::send_float(bar, "statusItemWithLength:", -1.0);
+            let item = objc::retain(objc::send_float(bar, "statusItemWithLength:", -1.0));
             let menu = make_menu(state.controller);
             objc::send_void_obj(item, "setMenu:", menu);
             state.status_items.push(item);
         } else {
             for category in &categories {
-                let item = objc::send_float(bar, "statusItemWithLength:", -1.0);
+                let item = objc::retain(objc::send_float(bar, "statusItemWithLength:", -1.0));
                 let menu = make_menu(state.controller);
                 objc::send_void_obj(item, "setMenu:", menu);
                 if let Some(button) = button_of(item) {
@@ -485,11 +488,9 @@ fn populate(state: &mut AppState, menu: Obj) {
             objc::send_void_int(submenu, "setAutoenablesItems:", 0);
             populate_submenu(state, submenu, category, &reading);
             objc::send_void_obj(item, "setSubmenu:", submenu);
+            objc::send_void_int(item, "setTag:", row_tag(category));
             objc::send_void_obj(menu, "addItem:", item);
-            state.live_items.insert(
-                category_tag(category, None),
-                item,
-            );
+            state.live_items.insert(row_tag(category), item);
         }
 
         objc::send_void_obj(menu, "addItem:", objc::send(objc::class("NSMenuItem"), "separatorItem"));
@@ -606,7 +607,7 @@ fn refresh_values(state: &mut AppState) {
         );
         for category in ALL_CATEGORIES {
             let reading = state.store.get(category);
-            if let Some(item) = state.live_items.get(&category_tag(category, None)).copied() {
+            if let Some(item) = state.live_items.get(&row_tag(category)).copied() {
                 let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
                 set_row_title(
                     item,
@@ -654,6 +655,13 @@ fn display_key(sensor: &crate::model::Sensor) -> Option<&str> {
         return None;
     }
     Some(&sensor.key)
+}
+
+/// Key for a category's own row. It must not collide with the sensor tags,
+/// because the Average entry carries `category_tag(category, None)` and the
+/// two would otherwise overwrite each other in the live-item map.
+fn row_tag(category: Category) -> isize {
+    -1000 - (category.index() as isize)
 }
 
 fn category_tag(category: Category, sensor: Option<usize>) -> isize {
@@ -987,6 +995,9 @@ pub fn dump_menu() -> String {
                     name, sub_size.width, sub_size.height
                 ));
             }
+            // Dump what an open menu looks like after a live refresh, so a
+            // value update cannot quietly rewrite a row's label.
+            refresh_values(state);
             out.push_str("\n## Row style\n");
             out.push_str(&row_style_report(96.0));
             out.push_str("\n## Dropdown\n");
