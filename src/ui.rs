@@ -554,6 +554,8 @@ fn column_right_with(labels: &[String], values: &[String], extra: f64) -> f64 {
 const COLUMN_GUTTER: f64 = 22.0;
 /// Room the leading category icon takes in the dropdown's label column.
 const ICON_WIDTH: f64 = 20.0;
+/// Square an icon is drawn into.
+const ICON_BOX: f64 = 14.0;
 /// Space between the category icon and its name.
 const ICON_GAP: &str = "\u{2009}\u{2009}\u{2009}\u{2009}";
 
@@ -751,6 +753,31 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
 /// Rewrites the value columns of the menu that is currently open.
 fn refresh_values(state: &mut AppState) {
     unsafe {
+        // The first open can land before the first poll, when every value is
+        // still a placeholder and the column the menu was built with is too
+        // narrow for what arrives a moment later. Recompute it from the values
+        // about to be written, so all rows share one edge.
+        let labels: Vec<String> = ALL_CATEGORIES
+            .iter()
+            .map(|category| category.title().to_string())
+            .collect();
+        let values: Vec<String> = ALL_CATEGORIES
+            .iter()
+            .map(|category| {
+                let reading = state.store.get(*category);
+                let value =
+                    reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
+                if value.has_data() {
+                    value.text.clone()
+                } else {
+                    "No data".to_string()
+                }
+            })
+            .collect();
+        let needed = column_right_with(&labels, &values, ICON_WIDTH);
+        if needed > state.row_tab {
+            state.row_tab = needed;
+        }
         let row_tab = state.row_tab;
         for category in ALL_CATEGORIES {
             let reading = state.store.get(category);
@@ -1116,12 +1143,48 @@ fn symbol_image(category: Category, reading: &CategoryReading) -> Option<Obj> {
     } else {
         category.symbols().iter().copied().find(|name| system_image(name).is_some())
     }?;
-    let image = system_image(name)?;
+    fitted_symbol(name)
+}
+
+/// Draws a symbol into a fixed square so every icon occupies the same width
+/// and every label starts at the same x. Symbols keep their own aspect ratio,
+/// which is why their natural widths differ.
+fn fitted_symbol(name: &str) -> Option<Obj> {
     unsafe {
-        objc::send_void_two_floats(image, "setSize:", 14.0, 14.0);
-        objc::send_void_int(image, "setTemplate:", 1);
+        let symbol = system_image(name)?;
+        let natural = objc::send_size(symbol, "size");
+        if natural.width <= 0.0 || natural.height <= 0.0 {
+            return None;
+        }
+        let scale = (ICON_BOX / natural.width).min(ICON_BOX / natural.height);
+        let width = natural.width * scale;
+        let height = natural.height * scale;
+        let canvas = objc::send_obj_two_floats(
+            objc::alloc("NSImage"),
+            "initWithSize:",
+            ICON_BOX,
+            ICON_BOX,
+        );
+        objc::send_void(canvas, "lockFocus");
+        let target = objc::CgRect {
+            x: (ICON_BOX - width) / 2.0,
+            y: (ICON_BOX - height) / 2.0,
+            width,
+            height,
+        };
+        let source = objc::CgRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        objc::send_void_rect_rect_int_float(
+            symbol,
+            "drawInRect:fromRect:operation:fraction:",
+            &target,
+            &source,
+            2,
+            1.0,
+        );
+        objc::send_void(canvas, "unlockFocus");
+        objc::send_void_int(canvas, "setTemplate:", 1);
+        Some(canvas)
     }
-    Some(image)
 }
 
 /// Builds the dropdown and prints it, without creating any status item, so

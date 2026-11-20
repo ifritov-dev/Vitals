@@ -283,3 +283,16 @@ pub unsafe fn send_void_rect(obj: Obj, sel: &str, rect: &CgRect) {
     let function: unsafe extern "C" fn(Obj, Sel, *const CgRect) = transmute(objc_msgSend as *const ());
     function(obj, selector(sel), rect);
 }
+
+pub unsafe fn send_void_rect_rect_int_float(
+    obj: Obj,
+    sel: &str,
+    a: *const CgRect,
+    b: *const CgRect,
+    op: isize,
+    fraction: f64,
+) {
+    let function: unsafe extern "C" fn(Obj, Sel, *const CgRect, *const CgRect, isize, f64) =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b, op, fraction);
+}
