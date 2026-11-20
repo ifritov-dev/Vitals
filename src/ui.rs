@@ -445,7 +445,8 @@ unsafe fn set_row_title(item: Obj, left: &str, right: &str, tab_stop: f64, dim: 
 /// value sits against the same edge as a long one; the widest value's own
 /// width is part of the stop, otherwise the longest value would run back over
 /// its label instead of ending at that edge.
-fn tab_stop_for(labels: &[String], values: &[String]) -> f64 {
+/// Right edge of the value column.
+fn column_right_for(labels: &[String], values: &[String]) -> f64 {
     let widest_label = widest_text(labels, false);
     let widest_value = widest_text(values, true);
     (widest_label.ceil() + COLUMN_GUTTER + widest_value.ceil()).ceil()
@@ -505,7 +506,7 @@ fn populate(state: &mut AppState, menu: Obj) {
                 }
             })
             .collect();
-        state.row_tab = tab_stop_for(&labels, &values);
+        state.row_tab = column_right_for(&labels, &values);
         let row_tab = state.row_tab;
 
         for category in ALL_CATEGORIES {
@@ -602,7 +603,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
         let values: Vec<String> = std::iter::once(reading.average.text.clone())
             .chain(reading.sensors.iter().map(|sensor| sensor.reading.text.clone()))
             .collect();
-        let tab = tab_stop_for(&labels, &values);
+        let tab = column_right_for(&labels, &values);
         state.sensor_tabs[category.index()] = tab;
 
         let average = action_item("Average", state.controller, category_tag(category, None));
@@ -844,10 +845,27 @@ impl Attributed {
         }
     }
 
-    /// Two-column row: label, a right tab stop, then the value.
-    fn row(left: &str, right: &str, tab_stop: f64, dim: bool) -> Obj {
+    /// Two-column row: label, a tab, then the value ending on `column_right`.
+    ///
+    /// The tab is placed where this row's value has to start, not on the
+    /// column edge with right alignment. A right-aligned stop makes AppKit
+    /// reserve the tab position *and* the value's width when it sizes the
+    /// menu, which leaves a dead band between the values and the menu edge.
+    fn row(left: &str, right: &str, column_right: f64, dim: bool) -> Obj {
         unsafe {
             let text = format!("{left}\t{right}");
+            let value_font = objc::send_obj_two_floats(
+                objc::class("NSFont"),
+                "monospacedDigitSystemFontOfSize:weight:",
+                objc::system_font_size(),
+                0.0,
+            );
+            let value_width = text_width(objc::nsstring(right), {
+                let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
+                objc::send_void_obj_obj(attributes, "setObject:forKey:", value_font, objc::nsstring("NSFont"));
+                attributes
+            });
+            let tab_stop = (column_right - value_width).max(0.0);
             let paragraph = objc::send(objc::alloc("NSMutableParagraphStyle"), "init");
             let tab = objc::send_tab(tab_stop);
             let tabs = objc::send(objc::class("NSMutableArray"), "array");
@@ -882,12 +900,6 @@ impl Attributed {
 
             if dim {
                 let value_start = left.chars().count() + 1;
-                let value_font = objc::send_obj_two_floats(
-                    objc::class("NSFont"),
-                    "monospacedDigitSystemFontOfSize:weight:",
-                    objc::system_font_size(),
-                    0.0,
-                );
                 objc::send_attr_range(
                     string,
                     "addAttribute:value:range:",
@@ -1016,13 +1028,17 @@ pub fn dump_menu() -> String {
                 let text = if value.has_data() { &value.text } else { "No data" };
                 let label_width = text_width(objc::nsstring(category.title()), attrs);
                 let value_width = text_width(objc::nsstring(text), attrs);
+                let row = Attributed::row(category.title(), text, state.row_tab, false);
+                let row_width = objc::send_size(row, "size").width;
+                objc::release(row);
                 out.push_str(&format!(
-                    "   {:<12} label ends {:>6.1}, value starts {:>6.1}, gap {:>5.1}, ends {:>6.1}\n",
+                    "   {:<12} label ends {:>6.1}, value starts {:>6.1}, gap {:>5.1}, ends {:>6.1}, row {:>6.1}\n",
                     category.title(),
                     label_width,
                     state.row_tab - value_width,
                     state.row_tab - value_width - label_width,
-                    state.row_tab
+                    state.row_tab,
+                    row_width
                 ));
             }
             let size = objc::send_size(menu, "size");

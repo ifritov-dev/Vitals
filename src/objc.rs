@@ -197,7 +197,7 @@ pub unsafe fn send_tab(location: f64) -> Obj {
     function(
         alloc("NSTextTab"),
         selector("initWithTextAlignment:location:options:"),
-        1,
+        0,
         location,
         options,
     )
