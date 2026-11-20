@@ -123,11 +123,9 @@ pub fn config_dump(prefs: &Prefs) -> String {
         selections.push(format!("{}={}", category.key(), choice));
     }
     format!(
-        "menuBarCategories = {:?}\nrefreshInterval   = {} s\nshowIcons         = {}\ncompactSlot       = {}\nselections        = {}\n",
+        "menuBarCategories = {:?}\nrefreshInterval   = {} s\nselections        = {}\n",
         slots,
         prefs.interval,
-        prefs.show_icons,
-        prefs.compact,
         selections.join(", ")
     )
 }

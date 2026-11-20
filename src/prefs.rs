@@ -8,10 +8,9 @@ use crate::objc::{self, Obj};
 const KEY_CATEGORIES: &str = "menuBarCategories";
 const KEY_SELECTIONS: &str = "categorySelections";
 const KEY_INTERVAL: &str = "refreshInterval";
-const KEY_SHOW_ICONS: &str = "showIconsInMenuBar";
-const KEY_COMPACT: &str = "compactSingleSlot";
 
 pub const INTERVAL_RANGE: (f64, f64) = (1.0, 10.0);
+pub const DEFAULT_INTERVAL: f64 = 5.0;
 pub const DEFAULT_CATEGORIES: [Category; 3] = [Category::Memory, Category::System, Category::Processor];
 
 #[derive(Clone, Debug)]
@@ -19,8 +18,6 @@ pub struct Prefs {
     pub menu_bar: Vec<Category>,
     pub selections: HashMap<String, String>,
     pub interval: f64,
-    pub show_icons: bool,
-    pub compact: bool,
 }
 
 impl Default for Prefs {
@@ -28,9 +25,7 @@ impl Default for Prefs {
         Prefs {
             menu_bar: DEFAULT_CATEGORIES.to_vec(),
             selections: HashMap::new(),
-            interval: 2.0,
-            show_icons: true,
-            compact: true,
+            interval: DEFAULT_INTERVAL,
         }
     }
 }
@@ -96,14 +91,6 @@ impl Prefs {
                 prefs.interval = interval;
             }
 
-            let has_icons = objc::send_obj(store, "objectForKey:", objc::nsstring(KEY_SHOW_ICONS));
-            if !has_icons.is_null() {
-                prefs.show_icons = objc::send_bool_result(has_icons, "boolValue");
-            }
-            let has_compact = objc::send_obj(store, "objectForKey:", objc::nsstring(KEY_COMPACT));
-            if !has_compact.is_null() {
-                prefs.compact = objc::send_bool_result(has_compact, "boolValue");
-            }
         }
         prefs
     }
@@ -132,20 +119,6 @@ impl Prefs {
             let interval = objc::send_float(objc::class("NSNumber"), "numberWithDouble:", self.interval);
             objc::send_void_obj_obj(store, "setObject:forKey:", interval, objc::nsstring(KEY_INTERVAL));
 
-            let icons = objc::send_int(
-                objc::class("NSNumber"),
-                "numberWithBool:",
-                if self.show_icons { 1 } else { 0 },
-            );
-            objc::send_void_obj_obj(store, "setObject:forKey:", icons, objc::nsstring(KEY_SHOW_ICONS));
-
-            let compact = objc::send_int(
-                objc::class("NSNumber"),
-                "numberWithBool:",
-                if self.compact { 1 } else { 0 },
-            );
-            objc::send_void_obj_obj(store, "setObject:forKey:", compact, objc::nsstring(KEY_COMPACT));
-
             objc::send_bool_result(store, "synchronize");
         }
     }
@@ -169,27 +142,40 @@ impl Prefs {
         self.save();
     }
 
-    pub fn toggle_category(&mut self, category: Category) {
-        if self.menu_bar.contains(&category) {
-            self.menu_bar.retain(|c| *c != category);
-        } else {
-            self.menu_bar.push(category);
+    /// Picking a row in a category's submenu is how a category is shown or
+    /// hidden: choosing the row that is already active takes the category out
+    /// of the menu bar, choosing any other row puts it there.
+    pub fn toggled(&self, category: Category, sensor: Option<&str>) -> Prefs {
+        let mut next = self.clone();
+        let active = next.selections.get(category.key()).map(|id| id.as_str());
+        if next.menu_bar.contains(&category) && active == sensor {
+            next.menu_bar.retain(|c| *c != category);
+            next.selections.remove(category.key());
+            return next;
         }
+        match sensor {
+            Some(id) => {
+                next.selections.insert(category.key().to_string(), id.to_string());
+            }
+            None => {
+                next.selections.remove(category.key());
+            }
+        }
+        if !next.menu_bar.contains(&category) {
+            next.menu_bar.push(category);
+        }
+        next
+    }
+
+    pub fn toggle_selection(&mut self, category: Category, sensor: Option<&str>) {
+        *self = self.toggled(category, sensor);
         self.save();
     }
+
+
 
     pub fn set_interval(&mut self, seconds: f64) {
         self.interval = seconds.clamp(INTERVAL_RANGE.0, INTERVAL_RANGE.1);
-        self.save();
-    }
-
-    pub fn set_show_icons(&mut self, value: bool) {
-        self.show_icons = value;
-        self.save();
-    }
-
-    pub fn set_compact(&mut self, value: bool) {
-        self.compact = value;
         self.save();
     }
 

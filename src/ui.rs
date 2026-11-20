@@ -16,8 +16,6 @@ use crate::objc::{self, NSRunLoopCommonModes, NSSize, Obj, Sel};
 use crate::prefs::Prefs;
 use crate::store::SensorStore;
 
-const TAG_SHOW_ICONS: isize = -20;
-const TAG_COMPACT: isize = -21;
 const TAG_QUIT: isize = -22;
 const TAG_INTERVAL_BASE: isize = -30;
 
@@ -188,9 +186,11 @@ unsafe extern "C" fn demo_actions(_this: Obj, _cmd: Sel, _timer: Obj) {
         dispatch(state, category_tag(Category::Temperature, Some(4)));
         eprintln!("demo: selecting Average again");
         dispatch(state, category_tag(Category::Temperature, None));
-        eprintln!("demo: toggling the compact slot");
-        dispatch(state, TAG_COMPACT);
-        dispatch(state, TAG_COMPACT);
+        eprintln!("demo: hiding and restoring the first category");
+        let first = ALL_CATEGORIES[0];
+        let active = state.prefs.selection(first).cloned();
+        dispatch(state, category_tag(first, None));
+        dispatch(state, category_tag(first, active.is_some().then_some(0)));
         eprintln!("demo: toggling a menu bar category");
         dispatch(state, -((Category::Battery.index() as isize) + 1));
         dispatch(state, -((Category::Battery.index() as isize) + 1));
@@ -258,10 +258,8 @@ fn make_controller() -> Obj {
 
 fn signature(prefs: &Prefs) -> String {
     format!(
-        "{:?}|{}|{}",
-        prefs.ordered_menu_bar().iter().map(|c| c.key()).collect::<Vec<_>>(),
-        prefs.show_icons,
-        prefs.compact
+        "{:?}",
+        prefs.ordered_menu_bar().iter().map(|c| c.key()).collect::<Vec<_>>()
     )
 }
 
@@ -277,25 +275,11 @@ fn rebuild_status_items(state: &mut AppState) {
 
         // +statusItemWithLength: hands back an autoreleased item, and the
         // pointer we keep has to outlive the pool that created it.
-        if state.prefs.compact {
-            let item = objc::retain(objc::send_float(bar, "statusItemWithLength:", -1.0));
-            let menu = make_menu(state.controller);
-            objc::send_void_obj(item, "setMenu:", menu);
-            state.status_items.push(item);
-        } else {
-            for category in &categories {
-                let item = objc::retain(objc::send_float(bar, "statusItemWithLength:", -1.0));
-                let menu = make_menu(state.controller);
-                objc::send_void_obj(item, "setMenu:", menu);
-                if let Some(button) = button_of(item) {
-                    objc::send_void_obj(button, "setToolTip:", objc::nsstring(&format!(
-                        "Vitals — {}",
-                        category.title()
-                    )));
-                }
-                state.status_items.push(item);
-            }
-        }
+        let item = objc::retain(objc::send_float(bar, "statusItemWithLength:", -1.0));
+        let menu = make_menu(state.controller);
+        objc::send_void_obj(item, "setMenu:", menu);
+        state.status_items.push(item);
+        let _ = categories;
         state.last_signature = signature(&state.prefs);
         update_status_titles(state);
     }
@@ -320,7 +304,7 @@ unsafe fn button_of(item: Obj) -> Option<Obj> {
 fn update_status_titles(state: &mut AppState) {
     unsafe {
         let categories = state.prefs.ordered_menu_bar();
-        if state.prefs.compact {
+        {
             let Some(item) = state.status_items.first() else {
                 return;
             };
@@ -341,8 +325,7 @@ fn update_status_titles(state: &mut AppState) {
                 } else {
                     "—".to_string()
                 };
-                if state.prefs.show_icons {                    title.append_symbol(*category, reading);
-                }
+                title.append_symbol(*category, reading);
                 title.append_string(&format!("\u{2009}{value}"));
             }
             if title.is_empty() {
@@ -364,25 +347,6 @@ fn update_status_titles(state: &mut AppState) {
                 .collect::<Vec<_>>()
                 .join("\n");
             objc::send_void_obj(button, "setToolTip:", objc::nsstring(&tooltip));
-        } else {
-            for (index, category) in categories.iter().enumerate() {
-                let Some(item) = state.status_items.get(index) else {
-                    continue;
-                };
-                let Some(button) = button_of(*item) else { continue };
-                let reading = state.store.get(*category);
-                let value = reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
-                let mut title = Attributed::new();
-                if state.prefs.show_icons {                    title.append_symbol(*category, reading);
-                }
-                title.append_string(&format!(
-                    "\u{2009}{}",
-                    if value.has_data() { &value.compact } else { "—" }
-                ));
-                let finished = title.finish();
-                objc::send_void_obj(button, "setAttributedTitle:", finished);
-                objc::release(finished);
-            }
         }
     }
 }
@@ -539,29 +503,6 @@ fn populate(state: &mut AppState, menu: Obj) {
         objc::send_void_obj(menu, "addItem:", objc::send(objc::class("NSMenuItem"), "separatorItem"));
 
         // Configuration lives in the menu itself: no separate window.
-        let menu_bar_item = menu_item("Menu Bar", "", 0);
-        let menu_bar_menu = objc::send_obj(
-            objc::alloc("NSMenu"),
-            "initWithTitle:",
-            objc::nsstring("Menu Bar"),
-        );
-        for category in ALL_CATEGORIES {
-            let item = action_item(category.title(), state.controller, -((category.index() as isize) + 1));
-            let on = state.prefs.menu_bar.contains(&category);
-            objc::send_void_int(item, "setState:", if on { 1 } else { 0 });
-            objc::send_void_obj(menu_bar_menu, "addItem:", item);
-        }
-        objc::send_void_obj(menu_bar_item, "setSubmenu:", menu_bar_menu);
-        objc::send_void_obj(menu, "addItem:", menu_bar_item);
-
-        let icons = action_item("Show Icons in Menu Bar", state.controller, TAG_SHOW_ICONS);
-        objc::send_void_int(icons, "setState:", if state.prefs.show_icons { 1 } else { 0 });
-        objc::send_void_obj(menu, "addItem:", icons);
-
-        let compact = action_item("Single Compact Slot", state.controller, TAG_COMPACT);
-        objc::send_void_int(compact, "setState:", if state.prefs.compact { 1 } else { 0 });
-        objc::send_void_obj(menu, "addItem:", compact);
-
         let interval_item = menu_item("Refresh Interval", "", 0);
         let interval_menu = objc::send_obj(
             objc::alloc("NSMenu"),
@@ -721,7 +662,7 @@ fn dispatch(state: &mut AppState, tag: isize) {
                 .get(sensor_index - 1)
                 .map(|sensor| sensor.id.clone())
         };
-        state.prefs.set_selection(category, selection.as_deref());
+        state.prefs.toggle_selection(category, selection.as_deref());
         refresh_values(state);
         update_status_titles(state);
         if signature(&state.prefs) != state.last_signature {
@@ -733,14 +674,6 @@ fn dispatch(state: &mut AppState, tag: isize) {
         return;
     }
     match tag {
-        TAG_SHOW_ICONS => {
-            let value = state.prefs.show_icons;
-            state.prefs.set_show_icons(!value);
-        }
-        TAG_COMPACT => {
-            let value = state.prefs.compact;
-            state.prefs.set_compact(!value);
-        }
         TAG_QUIT => unsafe {
             let app = objc::send(objc::class("NSApplication"), "sharedApplication");
             objc::send_void_obj(app, "terminate:", std::ptr::null_mut());
@@ -749,12 +682,7 @@ fn dispatch(state: &mut AppState, tag: isize) {
             let seconds = (-other - 30) as f64;
             state.prefs.set_interval(seconds);
         }
-        other => {
-            let category_index = (-other - 1) as usize;
-            if let Some(category) = ALL_CATEGORIES.get(category_index).copied() {
-                state.prefs.toggle_category(category);
-            }
-        }
+        _ => {}
     }
     if signature(&state.prefs) != state.last_signature {
         rebuild_status_items(state);
@@ -1089,7 +1017,7 @@ fn row_style_report(tab_stop: f64) -> String {
         let location = objc::send_float_result(tab, "location");
         let alignment = objc::send_int_result(tab, "alignment");
         out.push_str(&format!(
-            "   tab stop: location={location:.1} pt alignment={alignment} (1 = right)\n"
+            "   tab stop: location={location:.1} pt alignment={alignment} (0 = left; each row places its own stop so its value ends on the column edge)\n"
         ));
         let row = Attributed::row("Temperature", "45.7 °C", tab_stop, true);
         let size = objc::send_size(row, "size");

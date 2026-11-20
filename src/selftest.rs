@@ -2,6 +2,7 @@
 
 use crate::model::{format, Category, CategoryReading, Reading};
 use crate::prefs::Prefs;
+use std::collections::HashMap;
 use crate::smc::decode;
 
 pub struct Outcome {
@@ -84,6 +85,36 @@ pub fn run() -> Outcome {
         format::scaled_bytes(12.4 * 1024.0 * 1024.0) == "12.4 MB",
     );
     out.check("compact percent", format::percent(57.859).compact == "58%");
+
+    // Choosing the row that is already active hides its category; choosing
+    // anything else shows it and selects that row.
+    let base = Prefs {
+        menu_bar: vec![Category::Memory],
+        selections: HashMap::new(),
+        interval: 5.0,
+    };
+    let shown = base.toggled(Category::Processor, Some("PROC_0"));
+    out.check(
+        "picking a sensor shows its category",
+        shown.menu_bar.contains(&Category::Processor)
+            && shown.selection(Category::Processor).map(|s| s.as_str()) == Some("PROC_0"),
+    );
+    let again = shown.toggled(Category::Processor, Some("PROC_0"));
+    out.check(
+        "picking the active sensor hides its category",
+        !again.menu_bar.contains(&Category::Processor) && again.selection(Category::Processor).is_none(),
+    );
+    let average = base.toggled(Category::Memory, None);
+    out.check(
+        "picking Average on a shown category hides it",
+        !average.menu_bar.contains(&Category::Memory),
+    );
+    let other = shown.toggled(Category::Processor, Some("PROC_1"));
+    out.check(
+        "picking another sensor keeps the category and moves the check",
+        other.menu_bar.contains(&Category::Processor)
+            && other.selection(Category::Processor).map(|s| s.as_str()) == Some("PROC_1"),
+    );
     out.check("percent text", format::percent(57.859).text == "57.9%");
     out.check(
         "temperature text",
