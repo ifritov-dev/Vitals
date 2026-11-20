@@ -319,3 +319,42 @@ pub unsafe fn send_int_obj_result2(obj: Obj, sel: &str, arg: usize) -> usize {
     let function: unsafe extern "C" fn(Obj, Sel, usize) -> usize = transmute(objc_msgSend as *const ());
     function(obj, selector(sel), arg)
 }
+
+pub unsafe fn bitmap_rep(width: isize, height: isize) -> Obj {
+    let function: unsafe extern "C" fn(
+        Obj,
+        Sel,
+        *mut u8,
+        isize,
+        isize,
+        isize,
+        isize,
+        bool,
+        bool,
+        Obj,
+        isize,
+        isize,
+    ) -> Obj = transmute(objc_msgSend as *const ());
+    function(
+        alloc("NSBitmapImageRep"),
+        selector("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
+        std::ptr::null_mut(),
+        width,
+        height,
+        8,
+        4,
+        true,
+        false,
+        nsstring("NSDeviceRGBColorSpace"),
+        0,
+        0,
+    )
+}
+
+pub unsafe fn graphics_context_for(bitmap: Obj) -> Obj {
+    send_obj(class("NSGraphicsContext"), "graphicsContextWithBitmapImageRep:", bitmap)
+}
+
+pub unsafe fn set_current_graphics_context(context: Obj) {
+    send_void_obj(class("NSGraphicsContext"), "setCurrentContext:", context);
+}

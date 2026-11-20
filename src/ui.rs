@@ -524,7 +524,7 @@ unsafe fn set_row_title(item: Obj, left: &str, right: &str, tab_stop: f64, dim: 
 
 unsafe fn set_row_title_with_symbol(
     item: Obj,
-    symbol: Option<Obj>,
+    symbol: Option<(Obj, f64)>,
     left: &str,
     right: &str,
     tab_stop: f64,
@@ -537,10 +537,8 @@ unsafe fn set_row_title_with_symbol(
 }
 
 /// Right edge of the value column. Values are right-aligned here, so a short
-/// value sits against the same edge as a long one; the widest value's own
-/// width is part of the stop, otherwise the longest value would run back over
-/// its label instead of ending at that edge.
-/// Right edge of the value column.
+/// Right edge of the value column: values are right-aligned here, so a short
+/// value sits against the same edge as a long one.
 fn column_right_for(labels: &[String], values: &[String]) -> f64 {
     column_right_with(labels, values, 0.0)
 }
@@ -559,21 +557,32 @@ const ICON_BOX: f64 = 14.0;
 /// Where every category name starts when the row has an icon.
 const ICON_SLOT: f64 = 22.0;
 
-/// How many menu-font spaces separate the icon from the name.
-fn icon_gap_spaces() -> usize {
+/// Narrowest space the menu font will draw, and how many of them carry a row
+/// from its icon's advance to the icon column.
+///
+/// Only real characters move the text: a tab stop placed after an attachment
+/// is ignored and so is kerning, so the gap has to be a counted run of the
+/// narrowest space available. A hair space is about a third of a point, which
+/// lands the name within a pixel of the column.
+fn icon_pad(advance: f64) -> (char, usize) {
     unsafe {
         let font = objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0);
         let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
         objc::send_void_obj_obj(attributes, "setObject:forKey:", font, objc::nsstring("NSFont"));
-        let space = text_width(objc::nsstring(" "), attributes);
-        if space <= 0.0 {
-            return 2;
+        let mut best = (' ', text_width(objc::nsstring(" "), attributes));
+        for candidate in ['\u{200A}', '\u{2009}'] {
+            let width = text_width(objc::nsstring(&candidate.to_string()), attributes);
+            if width > 0.01 && width < best.1 {
+                best = (candidate, width);
+            }
         }
-        ((ICON_SLOT - ICON_BOX) / space).round().max(1.0) as usize
+        if best.1 <= 0.0 {
+            return (' ', 0);
+        }
+        let count = ((ICON_SLOT - advance) / best.1).round().max(0.0) as usize;
+        (best.0, count)
     }
 }
-/// Space between the category icon and its name.
-const ICON_GAP: &str = "\u{2009}\u{2009}\u{2009}\u{2009}";
 
 /// Values are drawn in the monospaced-digit font, so they have to be measured
 /// in it too; the menu font is narrower and would under-reserve the column.
@@ -644,13 +653,14 @@ fn populate(state: &mut AppState, menu: Obj) {
                 row_tab,
                 false,
             );
-            // The icon goes in the menu's own state column, which is a fixed
-            // slot at the left edge, so every row's icon and every row's name
-            // line up without the icon taking part in the title's layout.
-            if let Some(image) = symbol_image(category, &reading) {
-                objc::send_void_obj(item, "setOnStateImage:", image);
-                objc::send_void_int(item, "setState:", 1);
-            }
+            set_row_title_with_symbol(
+                item,
+                symbol_image(category, &reading),
+                category.title(),
+                if value.has_data() { &value.text } else { "No data" },
+                row_tab,
+                false,
+            );
             let submenu = objc::send_obj(
                 objc::alloc("NSMenu"),
                 "initWithTitle:",
@@ -814,13 +824,14 @@ fn refresh_values(state: &mut AppState) {
                 row_tab,
                 false,
             );
-            // The icon goes in the menu's own state column, which is a fixed
-            // slot at the left edge, so every row's icon and every row's name
-            // line up without the icon taking part in the title's layout.
-            if let Some(image) = symbol_image(category, &reading) {
-                objc::send_void_obj(item, "setOnStateImage:", image);
-                objc::send_void_int(item, "setState:", 1);
-            }
+            set_row_title_with_symbol(
+                item,
+                symbol_image(category, &reading),
+                category.title(),
+                if value.has_data() { &value.text } else { "No data" },
+                row_tab,
+                false,
+            );
         }
 
         // The sensor rows of the submenu that is on screen, if one is. The
@@ -1028,7 +1039,7 @@ impl Attributed {
     /// reserve the tab position *and* the value's width when it sizes the
     /// menu, which leaves a dead band between the values and the menu edge.
     fn row_with_symbol(
-        symbol: Option<Obj>,
+        symbol: Option<(Obj, f64)>,
         left: &str,
         right: &str,
         column_right: f64,
@@ -1047,11 +1058,15 @@ impl Attributed {
                 attributes
             });
 
-            // A tab stop placed right after an attachment is not honoured, so
-            // the icon column is a counted run of spaces in the menu font:
-            // every name then starts at the same x, whatever its symbol drew.
-            let gap = if symbol.is_some() { icon_gap_spaces() } else { 0 };
-            let text = format!("{}{left}\t{right}", " ".repeat(gap));
+            let (pad_char, pad_count) = match &symbol {
+                Some((_, advance)) => icon_pad(*advance),
+                None => (' ', 0),
+            };
+            let text = if symbol.is_some() {
+                format!("{}{left}\t{right}", pad_char.to_string().repeat(pad_count))
+            } else {
+                format!("{left}\t{right}")
+            };
 
             let value_stop = (column_right - value_width).max(ICON_SLOT + 1.0);
             let paragraph = objc::send(objc::alloc("NSMutableParagraphStyle"), "init");
@@ -1066,7 +1081,7 @@ impl Attributed {
                 objc::nsstring(&text),
             );
             let mut icon_offset = 0;
-            if let Some(image) = symbol {
+            if let Some((image, _)) = symbol {
                 let attachment = objc::send(objc::alloc("NSTextAttachment"), "init");
                 objc::send_void_obj(attachment, "setImage:", image);
                 let piece = objc::send_obj(
@@ -1074,7 +1089,25 @@ impl Attributed {
                     "attributedStringWithAttachment:",
                     attachment,
                 );
+                // An attachment advances by its image's own width, so a kern
+                // on the attachment character is what puts the name on the
+                // icon column's edge exactly. A tab stop there is ignored.
+                // The attachment advances by its cell's size; the attributed
+                // piece itself reports nothing until something lays it out.
+                let advance = objc::send_size(objc::send(attachment, "attachmentCell"), "cellSize").width;
                 objc::send_void_obj_int(string, "insertAttributedString:atIndex:", piece, 0);
+                objc::send_attr_range(
+                    string,
+                    "addAttribute:value:range:",
+                    objc::nsstring("NSKern"),
+                    objc::send_float(
+                        objc::class("NSNumber"),
+                        "numberWithDouble:",
+                        40.0,
+                    ),
+                    0,
+                    1,
+                );
                 objc::release(attachment);
                 icon_offset = 1;
             }
@@ -1099,7 +1132,7 @@ impl Attributed {
             );
 
             if dim {
-                let value_start = icon_offset + gap + left.chars().count() + 1;
+                let value_start = icon_offset + pad_count + left.chars().count() + 1;
                 objc::send_attr_range(
                     string,
                     "addAttribute:value:range:",
@@ -1161,18 +1194,22 @@ fn system_image(name: &str) -> Option<Obj> {
     }
 }
 
-fn symbol_image(category: Category, reading: &CategoryReading) -> Option<Obj> {
+fn symbol_image(category: Category, reading: &CategoryReading) -> Option<(Obj, f64)> {
     let name = if category == Category::Battery {
         battery_symbol(reading.reading_for(None).value)
     } else {
         category.symbols().iter().copied().find(|name| system_image(name).is_some())
     }?;
-    let image = system_image(name)?;
     unsafe {
+        let image = objc::send(system_image(name)?, "copy");
+        // The attachment advances by the image's own width, which no sizing
+        // call changes, so the width is reported and the title pads up to the
+        // icon column with spaces.
+        let advance = objc::send_size(image, "size").width;
         objc::send_void_two_floats(image, "setSize:", ICON_BOX, ICON_BOX);
         objc::send_void_int(image, "setTemplate:", 1);
+        Some((image, advance))
     }
-    Some(image)
 }
 
 /// Builds the dropdown and prints it, without creating any status item, so
@@ -1225,31 +1262,13 @@ pub fn dump_menu() -> String {
             let icon_sizes = ALL_CATEGORIES
                 .iter()
                 .filter_map(|category| symbol_image(*category, state.store.get(*category)))
-                .map(|image| {
+                .map(|(image, advance)| {
                     let size = objc::send_size(image, "size");
-                    format!("{:.0}x{:.0}", size.width, size.height)
+                    format!("{:.0}x{:.0}/{advance:.0}", size.width, size.height)
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
             out.push_str(&format!("\n## Icons\n   {icon_sizes}\n"));
-            let advances = ALL_CATEGORIES
-                .iter()
-                .filter_map(|category| symbol_image(*category, state.store.get(*category)))
-                .map(|image| {
-                    let attachment = objc::send(objc::alloc("NSTextAttachment"), "init");
-                    objc::send_void_obj(attachment, "setImage:", image);
-                    let piece = objc::send_obj(
-                        objc::class("NSAttributedString"),
-                        "attributedStringWithAttachment:",
-                        attachment,
-                    );
-                    let width = objc::send_size(piece, "size").width;
-                    objc::release(attachment);
-                    format!("{width:.1}")
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            out.push_str(&format!("   advances: {advances}\n"));
             out.push_str(&format!(
                 "\n## Columns (value column ends at {:.1} pt)\n",
                 state.row_tab
@@ -1273,10 +1292,9 @@ pub fn dump_menu() -> String {
                     false,
                 );
                 let row_width = objc::send_size(row, "size").width;
-                let name_index = if symbol.is_some() {
-                    1 + icon_gap_spaces()
-                } else {
-                    0
+                let name_index = match &symbol {
+                    Some((_, advance)) => 1 + icon_pad(*advance).1,
+                    None => 0,
                 };
                 let name_x = unsafe { name_position(row, name_index) };
                 objc::release(row);
