@@ -296,3 +296,15 @@ pub unsafe fn send_void_rect_rect_int_float(
         transmute(objc_msgSend as *const ());
     function(obj, selector(sel), a, b, op, fraction);
 }
+
+pub unsafe fn send_obj_size_int(obj: Obj, sel: &str, width: f64, height: f64, flag: isize) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, f64, f64, isize) -> Obj =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), width, height, flag)
+}
+
+pub unsafe fn send_void_range_point(obj: Obj, sel: &str, location: usize, length: usize, x: f64, y: f64) {
+    let function: unsafe extern "C" fn(Obj, Sel, usize, usize, f64, f64) =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), location, length, x, y);
+}

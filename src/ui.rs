@@ -1143,48 +1143,12 @@ fn symbol_image(category: Category, reading: &CategoryReading) -> Option<Obj> {
     } else {
         category.symbols().iter().copied().find(|name| system_image(name).is_some())
     }?;
-    fitted_symbol(name)
-}
-
-/// Draws a symbol into a fixed square so every icon occupies the same width
-/// and every label starts at the same x. Symbols keep their own aspect ratio,
-/// which is why their natural widths differ.
-fn fitted_symbol(name: &str) -> Option<Obj> {
+    let image = system_image(name)?;
     unsafe {
-        let symbol = system_image(name)?;
-        let natural = objc::send_size(symbol, "size");
-        if natural.width <= 0.0 || natural.height <= 0.0 {
-            return None;
-        }
-        let scale = (ICON_BOX / natural.width).min(ICON_BOX / natural.height);
-        let width = natural.width * scale;
-        let height = natural.height * scale;
-        let canvas = objc::send_obj_two_floats(
-            objc::alloc("NSImage"),
-            "initWithSize:",
-            ICON_BOX,
-            ICON_BOX,
-        );
-        objc::send_void(canvas, "lockFocus");
-        let target = objc::CgRect {
-            x: (ICON_BOX - width) / 2.0,
-            y: (ICON_BOX - height) / 2.0,
-            width,
-            height,
-        };
-        let source = objc::CgRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
-        objc::send_void_rect_rect_int_float(
-            symbol,
-            "drawInRect:fromRect:operation:fraction:",
-            &target,
-            &source,
-            2,
-            1.0,
-        );
-        objc::send_void(canvas, "unlockFocus");
-        objc::send_void_int(canvas, "setTemplate:", 1);
-        Some(canvas)
+        objc::send_void_two_floats(image, "setSize:", ICON_BOX, ICON_BOX);
+        objc::send_void_int(image, "setTemplate:", 1);
     }
+    Some(image)
 }
 
 /// Builds the dropdown and prints it, without creating any status item, so
@@ -1421,18 +1385,38 @@ pub fn render_rows(path: &str) {
             let height: f64 = rows.iter().map(|(_, h)| h + 6.0).sum::<f64>() + 8.0;
             let image = objc::send_obj_two_floats(objc::alloc("NSImage"), "initWithSize:", width, height);
             objc::send_void(image, "lockFocus");
+            if let Some(background) = Some(objc::send(objc::class("NSColor"), "blackColor")) {
+                let _ = background;
+            }
             let mut y = height - 4.0;
             for (title, row_height) in rows.iter() {
                 y -= row_height + 6.0;
-                objc::send_void_two_floats(*title, "drawAtPoint:", 4.0, y);
+                // Draw through the text system, which lays out attachments the
+                // way a menu item does; plain -drawAtPoint: does not.
+                let storage = objc::send_obj(
+                    objc::alloc("NSTextStorage"),
+                    "initWithAttributedString:",
+                    *title,
+                );
+                let manager = objc::send(objc::alloc("NSLayoutManager"), "init");
+                objc::send_void_obj(storage, "addLayoutManager:", manager);
+                let container = objc::send_obj_size_int(
+                    objc::alloc("NSTextContainer"),
+                    "initWithContainerSize:",
+                    width,
+                    row_height + 6.0,
+                    0,
+                );
+                objc::send_void_obj(manager, "addTextContainer:", container);
+                let glyphs = objc::send_int_result(manager, "numberOfGlyphs") as usize;
+                objc::send_void_range_point(manager, "drawGlyphsForGlyphRange:atPoint:", 0, glyphs, 4.0, y);
+                objc::release(manager);
+                objc::release(storage);
+                objc::release(container);
             }
             objc::send_void(image, "unlockFocus");
             let tiff = objc::send(image, "TIFFRepresentation");
-            let bitmap = objc::send_obj(
-                objc::class("NSBitmapImageRep"),
-                "imageRepWithData:",
-                tiff,
-            );
+            let bitmap = objc::send_obj(objc::class("NSBitmapImageRep"), "imageRepWithData:", tiff);
             let png = objc::send_obj_int_obj(
                 bitmap,
                 "representationUsingType:properties:",
