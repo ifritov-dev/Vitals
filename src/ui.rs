@@ -519,7 +519,18 @@ fn action_item(title: &str, controller: Obj, tag: isize) -> Obj {
 }
 
 unsafe fn set_row_title(item: Obj, left: &str, right: &str, tab_stop: f64, dim: bool) {
-    let attributed = Attributed::row(left, right, tab_stop, dim);
+    set_row_title_with_symbol(item, None, left, right, tab_stop, dim);
+}
+
+unsafe fn set_row_title_with_symbol(
+    item: Obj,
+    symbol: Option<Obj>,
+    left: &str,
+    right: &str,
+    tab_stop: f64,
+    dim: bool,
+) {
+    let attributed = Attributed::row_with_symbol(symbol, left, right, tab_stop, dim);
     objc::send_void_obj(item, "setAttributedTitle:", attributed);
     // The item retains it; this drops the +1 we hold from -initWithAttributedString:.
     objc::release(attributed);
@@ -531,12 +542,18 @@ unsafe fn set_row_title(item: Obj, left: &str, right: &str, tab_stop: f64, dim: 
 /// its label instead of ending at that edge.
 /// Right edge of the value column.
 fn column_right_for(labels: &[String], values: &[String]) -> f64 {
+    column_right_with(labels, values, 0.0)
+}
+
+fn column_right_with(labels: &[String], values: &[String], extra: f64) -> f64 {
     let widest_label = widest_text(labels, false);
     let widest_value = widest_text(values, true);
-    (widest_label.ceil() + COLUMN_GUTTER + widest_value.ceil()).ceil()
+    (widest_label.ceil() + extra + COLUMN_GUTTER + widest_value.ceil()).ceil()
 }
 
 const COLUMN_GUTTER: f64 = 22.0;
+/// Room the leading category icon takes in the dropdown's label column.
+const ICON_WIDTH: f64 = 20.0;
 
 /// Values are drawn in the monospaced-digit font, so they have to be measured
 /// in it too; the menu font is narrower and would under-reserve the column.
@@ -593,23 +610,21 @@ fn populate(state: &mut AppState, menu: Obj) {
                 }
             })
             .collect();
-        state.row_tab = column_right_for(&labels, &values);
+        state.row_tab = column_right_with(&labels, &values, ICON_WIDTH);
         let row_tab = state.row_tab;
 
         for category in ALL_CATEGORIES {
             let reading = state.store.get(category).clone();
             let item = menu_item(category.title(), "", 0);
             let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
-            set_row_title(
+            set_row_title_with_symbol(
                 item,
+                symbol_image(category, &reading),
                 category.title(),
                 if value.has_data() { &value.text } else { "No data" },
                 row_tab,
                 false,
             );
-            if let Some(image) = symbol_image(category, &reading) {
-                objc::send_void_obj(item, "setImage:", image);
-            }
             let submenu = objc::send_obj(
                 objc::alloc("NSMenu"),
                 "initWithTitle:",
@@ -741,8 +756,9 @@ fn refresh_values(state: &mut AppState) {
                 continue;
             };
             let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
-            set_row_title(
+            set_row_title_with_symbol(
                 item,
+                symbol_image(category, &reading),
                 category.title(),
                 if value.has_data() { &value.text } else { "No data" },
                 row_tab,
@@ -943,13 +959,24 @@ impl Attributed {
         }
     }
 
-    /// Two-column row: label, a tab, then the value ending on `column_right`.
+    /// A row without a leading icon.
+    fn row(left: &str, right: &str, column_right: f64, dim: bool) -> Obj {
+        Attributed::row_with_symbol(None, left, right, column_right, dim)
+    }
+
+/// Two-column row: label, a tab, then the value ending on `column_right`.
     ///
     /// The tab is placed where this row's value has to start, not on the
     /// column edge with right alignment. A right-aligned stop makes AppKit
     /// reserve the tab position *and* the value's width when it sizes the
     /// menu, which leaves a dead band between the values and the menu edge.
-    fn row(left: &str, right: &str, column_right: f64, dim: bool) -> Obj {
+    fn row_with_symbol(
+        symbol: Option<Obj>,
+        left: &str,
+        right: &str,
+        column_right: f64,
+        dim: bool,
+    ) -> Obj {
         unsafe {
             let text = format!("{left}\t{right}");
             let value_font = objc::send_obj_two_floats(
@@ -976,7 +1003,20 @@ impl Attributed {
                 "initWithString:",
                 objc::nsstring(&text),
             );
-            let full_length = text.chars().count();
+            let mut icon_offset = 0;
+            if let Some(image) = symbol {
+                let attachment = objc::send(objc::alloc("NSTextAttachment"), "init");
+                objc::send_void_obj(attachment, "setImage:", image);
+                let piece = objc::send_obj(
+                    objc::class("NSAttributedString"),
+                    "attributedStringWithAttachment:",
+                    attachment,
+                );
+                objc::send_void_obj_int(string, "insertAttributedString:atIndex:", piece, 0);
+                objc::release(attachment);
+                icon_offset = 1;
+            }
+            let full_length = text.chars().count() + icon_offset;
             objc::send_attr_range(
                 string,
                 "addAttribute:value:range:",
@@ -997,7 +1037,7 @@ impl Attributed {
             );
 
             if dim {
-                let value_start = left.chars().count() + 1;
+                let value_start = icon_offset + left.chars().count() + 1;
                 objc::send_attr_range(
                     string,
                     "addAttribute:value:range:",
