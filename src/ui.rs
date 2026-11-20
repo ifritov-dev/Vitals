@@ -1106,16 +1106,19 @@ impl Attributed {
                 }
             }
 
+            // The value is always drawn in the font its width was measured
+            // with; measuring in one font and drawing in another is what left
+            // a different amount of space at the right of every row.
+            let value_start = usize::from(icon.is_some()) + left.chars().count() + 1;
+            objc::send_attr_range(
+                string,
+                "addAttribute:value:range:",
+                objc::nsstring("NSFont"),
+                value_font,
+                value_start,
+                right.chars().count(),
+            );
             if dim {
-                let value_start = usize::from(icon.is_some()) + left.chars().count() + 1;
-                objc::send_attr_range(
-                    string,
-                    "addAttribute:value:range:",
-                    objc::nsstring("NSFont"),
-                    value_font,
-                    value_start,
-                    right.chars().count(),
-                );
                 let color = objc::send(objc::class("NSColor"), "secondaryLabelColor");
                 objc::send_attr_range(
                     string,
