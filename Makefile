@@ -17,6 +17,7 @@ build:
 app: build
 	rm -rf $(BUNDLE)
 	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources
+	@touch dist/.metadata_never_index
 	cp $(RELEASE_BIN) $(BUNDLE)/Contents/MacOS/$(APP_NAME)
 	cp packaging/Info.plist $(BUNDLE)/Contents/Info.plist
 	printf 'APPL????' > $(BUNDLE)/Contents/PkgInfo
@@ -27,11 +28,14 @@ run: app
 	open $(BUNDLE)
 
 install: app
-	@if [ -e $(INSTALL_DIR)/$(APP_NAME).app ]; then \
-		echo "✖ $(INSTALL_DIR)/$(APP_NAME).app already exists — refusing to overwrite"; exit 1; \
-	fi
+	rm -rf $(INSTALL_DIR)/$(APP_NAME).app
 	cp -R $(BUNDLE) $(INSTALL_DIR)/$(APP_NAME).app
-	@echo "✔ installed $(INSTALL_DIR)/$(APP_NAME).app"
+	rm -rf $(BUNDLE) dist/.metadata_never_index
+	@for stray in $(INSTALL_DIR)/$(APP_NAME)*.app; do \
+		case "$$stray" in "$(INSTALL_DIR)/$(APP_NAME).app") continue;; esac; \
+		[ -e "$$stray" ] && rm -rf "$$stray" && echo "removed stray $$stray"; \
+	done; true
+	@echo "✔ installed $(INSTALL_DIR)/$(APP_NAME).app (the only copy)"
 
 uninstall:
 	@rm -rf $(INSTALL_DIR)/$(APP_NAME).app && echo "✔ removed $(INSTALL_DIR)/$(APP_NAME).app"
