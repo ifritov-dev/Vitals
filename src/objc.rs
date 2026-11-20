@@ -197,7 +197,7 @@ pub unsafe fn send_tab(location: f64) -> Obj {
     function(
         alloc("NSTextTab"),
         selector("initWithTextAlignment:location:options:"),
-        1,
+        0,
         location,
         options,
     )
@@ -243,4 +243,14 @@ pub unsafe fn retain(obj: Obj) -> Obj {
 pub unsafe fn release(obj: Obj) {
     let function: unsafe extern "C" fn(Obj, Sel) = transmute(objc_msgSend as *const ());
     function(obj, selector("release"));
+}
+
+pub unsafe fn send_bool_obj_result(obj: Obj, sel: &str, a: Obj, b: bool) -> bool {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, bool) -> bool = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b)
+}
+
+pub unsafe fn send_obj_int_obj(obj: Obj, sel: &str, a: isize, b: Obj) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, isize, Obj) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b)
 }

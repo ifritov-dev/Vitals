@@ -69,6 +69,12 @@ fn main() {
         return;
     }
 
+    if let Some(path) = arg_value(&args, "--render-rows") {
+        ui::prepare_application();
+        ui::render_rows(&path);
+        return;
+    }
+
     if args.iter().any(|a| a == "--print-config") {
         ui::prepare_application();
         let prefs = Prefs::load();

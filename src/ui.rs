@@ -32,6 +32,11 @@ struct AppState {
     tracking_timer: Obj,
     last_refresh: Instant,
     last_signature: String,
+    /// Value column of the dropdown, fixed while the menu is open so a value
+    /// that grows between ticks moves nothing.
+    row_tab: f64,
+    /// Same, per category, for each submenu.
+    sensor_tabs: [f64; 9],
 }
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
@@ -71,6 +76,8 @@ pub fn run() {
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
+            row_tab: 0.0,
+            sensor_tabs: [0.0; 9],
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -434,18 +441,27 @@ unsafe fn set_row_title(item: Obj, left: &str, right: &str, tab_stop: f64, dim: 
     objc::release(attributed);
 }
 
+/// Left edge of the value column: past the widest label plus a gutter. The
+/// values are left-aligned here rather than right-aligned at a shared edge, so
+/// a long value like "46.8 °C" starts where every other value starts instead
+/// of running back over its label.
 fn tab_stop_for(labels: &[String]) -> f64 {
+    (widest_text(labels).ceil() + COLUMN_GUTTER).ceil()
+}
+
+const COLUMN_GUTTER: f64 = 22.0;
+
+fn widest_text(items: &[String]) -> f64 {
     unsafe {
         let font = objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0);
+        let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
+        objc::send_void_obj_obj(attributes, "setObject:forKey:", font, objc::nsstring("NSFont"));
         let mut widest: f64 = 0.0;
-        for label in labels {
-            let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
-            objc::send_void_obj_obj(attributes, "setObject:forKey:", font, objc::nsstring("NSFont"));
-            let text = objc::nsstring(label);
-            let size = text_width(text, attributes);
-            widest = widest.max(size);
+        for item in items {
+            let text = objc::nsstring(item);
+            widest = widest.max(text_width(text, attributes));
         }
-        widest.ceil() + 22.0
+        widest
     }
 }
 
@@ -459,12 +475,12 @@ fn populate(state: &mut AppState, menu: Obj) {
         objc::send_void(menu, "removeAllItems");
         state.live_items.clear();
 
-        let row_tab = tab_stop_for(
-            &ALL_CATEGORIES
-                .iter()
-                .map(|category| category.title().to_string())
-                .collect::<Vec<_>>(),
-        );
+        let labels: Vec<String> = ALL_CATEGORIES
+            .iter()
+            .map(|category| category.title().to_string())
+            .collect();
+        state.row_tab = tab_stop_for(&labels);
+        let row_tab = state.row_tab;
 
         for category in ALL_CATEGORIES {
             let reading = state.store.get(category).clone();
@@ -558,6 +574,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
             }))
             .collect();
         let tab = tab_stop_for(&labels);
+        state.sensor_tabs[category.index()] = tab;
 
         let average = action_item("Average", state.controller, category_tag(category, None));
         set_row_title(
@@ -599,12 +616,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
 /// Rewrites the value columns of the menu that is currently open.
 fn refresh_values(state: &mut AppState) {
     unsafe {
-        let row_tab = tab_stop_for(
-            &ALL_CATEGORIES
-                .iter()
-                .map(|category| category.title().to_string())
-                .collect::<Vec<_>>(),
-        );
+        let row_tab = state.row_tab;
         for category in ALL_CATEGORIES {
             let reading = state.store.get(category);
             if let Some(item) = state.live_items.get(&row_tag(category)).copied() {
@@ -617,14 +629,7 @@ fn refresh_values(state: &mut AppState) {
                     false,
                 );
             }
-            let sensor_tab = tab_stop_for(
-                &std::iter::once("Average".to_string())
-                    .chain(reading.sensors.iter().map(|sensor| match display_key(sensor) {
-                        Some(key) => format!("{key}  {}", sensor.label),
-                        None => sensor.label.clone(),
-                    }))
-                    .collect::<Vec<_>>(),
-            );
+            let sensor_tab = state.sensor_tabs[category.index()];
             if let Some(item) = state.live_items.get(&category_tag(category, None)).copied() {
                 set_row_title(
                     item,
@@ -946,6 +951,8 @@ pub fn dump_menu() -> String {
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
+            row_tab: 0.0,
+            sensor_tabs: [0.0; 9],
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -966,6 +973,30 @@ pub fn dump_menu() -> String {
                 state.prefs.interval,
                 diag::selection_summary(&state.prefs)
             ));
+            out.push_str(&format!(
+                "\n## Columns (value column starts at {:.1} pt)\n",
+                state.row_tab
+            ));
+            let font = objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0);
+            let attrs = objc::send(objc::class("NSMutableDictionary"), "dictionary");
+            objc::send_void_obj_obj(attrs, "setObject:forKey:", font, objc::nsstring("NSFont"));
+            for category in ALL_CATEGORIES {
+                let reading = state.store.get(category);
+                let value =
+                    reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
+                let text = if value.has_data() { &value.text } else { "No data" };
+                let label_width = text_width(objc::nsstring(category.title()), attrs);
+                let value_width = text_width(objc::nsstring(text), attrs);
+                let _ = value_width;
+                out.push_str(&format!(
+                    "   {:<12} label ends {:>6.1}, value starts {:>6.1}, gap {:>5.1}, ends {:>6.1}\n",
+                    category.title(),
+                    label_width,
+                    state.row_tab,
+                    state.row_tab - label_width,
+                    state.row_tab + value_width
+                ));
+            }
             let size = objc::send_size(menu, "size");
             out.push_str(&format!(
                 "\n## Menu widths\n   dropdown: {:.0} × {:.0} pt\n",
@@ -1060,5 +1091,81 @@ unsafe fn walk(menu: Obj, depth: usize, out: &mut String) {
         if !submenu.is_null() {
             walk(submenu, depth + 1, out);
         }
+    }
+}
+
+/// Draws the dropdown's rows, exactly as the menu draws them, into one image.
+/// Nothing appears on screen, so the column layout can be checked offscreen.
+pub fn render_rows(path: &str) {
+    prepare_application();
+    unsafe {
+        let controller = make_controller();
+        let mut store = SensorStore::new();
+        store.refresh();
+        let prefs = Prefs::load();
+        *STATE.lock().unwrap() = Some(AppState {
+            store,
+            prefs,
+            controller,
+            status_items: Vec::new(),
+            live_items: HashMap::new(),
+            open_menu: std::ptr::null_mut(),
+            tracking_timer: std::ptr::null_mut(),
+            row_tab: 0.0,
+            sensor_tabs: [0.0; 9],
+            last_refresh: Instant::now(),
+            last_signature: String::new(),
+        });
+        with_state(|state| {
+            let menu = make_menu(state.controller);
+            populate(state, menu);
+            let items = objc::send(menu, "itemArray");
+            let count = objc::send_int_result(items, "count");
+            let mut rows: Vec<(Obj, f64)> = Vec::new();
+            let mut widest: f64 = 0.0;
+            for index in 0..count {
+                let item = objc::send_int(items, "objectAtIndex:", index);
+                if item.is_null() || objc::send_bool_result(item, "isSeparatorItem") {
+                    continue;
+                }
+                let title = objc::send(item, "attributedTitle");
+                if title.is_null() {
+                    continue;
+                }
+                let size = objc::send_size(title, "size");
+                widest = widest.max(size.width);
+                rows.push((title, size.height));
+            }
+            let width = widest.ceil() + 8.0;
+            let height: f64 = rows.iter().map(|(_, h)| h + 6.0).sum::<f64>() + 8.0;
+            let image = objc::send_obj_two_floats(objc::alloc("NSImage"), "initWithSize:", width, height);
+            objc::send_void(image, "lockFocus");
+            let mut y = height - 4.0;
+            for (title, row_height) in rows.iter() {
+                y -= row_height + 6.0;
+                objc::send_void_two_floats(*title, "drawAtPoint:", 4.0, y);
+            }
+            objc::send_void(image, "unlockFocus");
+            let tiff = objc::send(image, "TIFFRepresentation");
+            let bitmap = objc::send_obj(
+                objc::class("NSBitmapImageRep"),
+                "imageRepWithData:",
+                tiff,
+            );
+            let png = objc::send_obj_int_obj(
+                bitmap,
+                "representationUsingType:properties:",
+                4,
+                objc::send(objc::class("NSDictionary"), "dictionary"),
+            );
+            let wrote = objc::send_bool_obj_result(
+                png,
+                "writeToFile:atomically:",
+                objc::nsstring(path),
+                true,
+            );
+            println!("rendered {} rows, width {width:.0} pt, wrote={wrote}", rows.len());
+            objc::release(image);
+        });
     }
 }
