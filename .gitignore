@@ -1,6 +1,5 @@
-.build/
+target/
 dist/
-.swiftpm/
+.build/
 .DS_Store
-*.xcodeproj
 .capy-managed.json

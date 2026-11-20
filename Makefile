@@ -1,12 +1,18 @@
+# The rustup toolchain may not be on PATH (especially when make runs from a
+# non-interactive shell), so cargo and rustc are both resolved from it.
+TOOLCHAIN   ?= $(HOME)/.rustup/toolchains/stable-aarch64-apple-darwin/bin
+CARGO       ?= $(shell command -v cargo 2>/dev/null || echo $(TOOLCHAIN)/cargo)
+BUILD_ENV   := PATH="$(TOOLCHAIN):$$PATH"
+
 APP_NAME    := Vitals
 BUNDLE      := dist/$(APP_NAME).app
-RELEASE_BIN := .build/release/$(APP_NAME)
+RELEASE_BIN := target/release/vitals
 INSTALL_DIR := /Applications
 
 .PHONY: build app run install uninstall dump verify clean
 
 build:
-	swift build -c release
+	$(BUILD_ENV) $(CARGO) build --release
 
 app: build
 	rm -rf $(BUNDLE)
@@ -38,4 +44,4 @@ dump: build
 	$(RELEASE_BIN) --dump
 
 clean:
-	rm -rf .build dist
+	$(BUILD_ENV) $(CARGO) clean && rm -rf dist

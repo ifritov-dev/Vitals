@@ -1,0 +1,244 @@
+//! Minimal hand-written bindings to the Objective-C runtime and AppKit.
+//!
+//! Deliberately not a binding crate: the app needs a dozen classes and this
+//! keeps the build dependency-free, at the cost of every message crossing an
+//! `objc_msgSend` transmute whose signature has to be right.
+
+use std::ffi::{c_char, c_void, CString};
+use std::mem::transmute;
+
+pub type Obj = *mut c_void;
+pub type Sel = *mut c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NSSize {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NSPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[link(name = "objc", kind = "dylib")]
+extern "C" {
+    fn objc_getClass(name: *const c_char) -> Obj;
+    fn sel_registerName(name: *const c_char) -> Sel;
+    pub fn objc_allocateClassPair(superclass: Obj, name: *const c_char, extra_bytes: usize) -> Obj;
+    pub fn objc_registerClassPair(cls: Obj);
+    pub fn class_addMethod(cls: Obj, sel: Sel, imp: *const c_void, types: *const c_char) -> bool;
+    pub fn object_getClass(obj: Obj) -> Obj;
+    fn objc_msgSend();
+}
+
+#[link(name = "Foundation", kind = "framework")]
+extern "C" {
+    pub static NSRunLoopCommonModes: Obj;
+}
+
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {}
+
+const NS_ASCII_STRING_ENCODING: usize = 1;
+
+fn cstring(value: &str) -> CString {
+    CString::new(value).unwrap_or_else(|_| CString::new("").unwrap())
+}
+
+pub unsafe fn class(name: &str) -> Obj {
+    objc_getClass(cstring(name).as_ptr())
+}
+
+pub unsafe fn selector(name: &str) -> Sel {
+    sel_registerName(cstring(name).as_ptr())
+}
+
+/// Sends a message that takes no arguments and returns an object.
+pub unsafe fn send(obj: Obj, sel: &str) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel))
+}
+
+pub unsafe fn send_obj(obj: Obj, sel: &str, arg: Obj) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+pub unsafe fn send_int(obj: Obj, sel: &str, arg: isize) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, isize) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+pub unsafe fn send_float(obj: Obj, sel: &str, arg: f64) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, f64) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+pub unsafe fn send_size(obj: Obj, sel: &str) -> NSSize {
+    let function: unsafe extern "C" fn(Obj, Sel) -> NSSize = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel))
+}
+
+pub unsafe fn send_void(obj: Obj, sel: &str) {
+    let function: unsafe extern "C" fn(Obj, Sel) = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel))
+}
+
+pub unsafe fn send_void_obj(obj: Obj, sel: &str, arg: Obj) {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj) = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+pub unsafe fn send_void_int(obj: Obj, sel: &str, arg: isize) {
+    let function: unsafe extern "C" fn(Obj, Sel, isize) = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+pub unsafe fn send_void_float(obj: Obj, sel: &str, arg: f64) {
+    let function: unsafe extern "C" fn(Obj, Sel, f64) = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+pub unsafe fn send_void_obj_int(obj: Obj, sel: &str, a: Obj, b: isize) {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, isize) =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b)
+}
+
+pub unsafe fn send_int_result(obj: Obj, sel: &str) -> isize {
+    let function: unsafe extern "C" fn(Obj, Sel) -> isize = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel))
+}
+
+pub unsafe fn send_float_result(obj: Obj, sel: &str) -> f64 {
+    let function: unsafe extern "C" fn(Obj, Sel) -> f64 = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel))
+}
+
+pub unsafe fn send_bool_result(obj: Obj, sel: &str) -> bool {
+    let function: unsafe extern "C" fn(Obj, Sel) -> bool = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel))
+}
+
+/// Allocates an instance of `name`.
+pub unsafe fn alloc(name: &str) -> Obj {
+    send(class(name), "alloc")
+}
+
+pub unsafe fn nsstring(value: &str) -> Obj {
+    let class = class("NSString");
+    let c = cstring(value);
+    let function: unsafe extern "C" fn(Obj, Sel, *const c_char, usize) -> Obj =
+        transmute(objc_msgSend as *const ());
+    function(
+        class,
+        selector("stringWithUTF8String:"),
+        c.as_ptr(),
+        NS_ASCII_STRING_ENCODING,
+    )
+}
+
+pub unsafe fn nsnumber_int(value: isize) -> Obj {
+    send_int(class("NSNumber"), "numberWithInteger:", value)
+}
+
+pub fn msg_send_ptr() -> *const () {
+    objc_msgSend as *const ()
+}
+
+pub unsafe fn send_void_obj_obj(obj: Obj, sel: &str, a: Obj, b: Obj) {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, Obj) = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b);
+}
+
+pub unsafe fn send_float_obj_result(obj: Obj, sel: &str, arg: Obj) -> f64 {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj) -> f64 = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+pub unsafe fn send_int_obj_result(obj: Obj, sel: &str, arg: Obj) -> isize {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj) -> isize = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}
+
+/// `-addAttribute:value:range:` (range is an NSRange, two uintptr-sized words).
+pub unsafe fn send_obj_obj(obj: Obj, sel: &str, a: Obj, b: Obj) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, Obj) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b)
+}
+
+pub unsafe fn send_obj_sel_obj(obj: Obj, sel: &str, a: Obj, action: Sel, b: Obj) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, Sel, Obj) -> Obj =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, action, b)
+}
+
+pub unsafe fn send_obj_two_floats(obj: Obj, sel: &str, a: f64, b: f64) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, f64, f64) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b)
+}
+
+pub unsafe fn send_size_obj(obj: Obj, sel: &str, a: Obj) -> NSSize {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj) -> NSSize = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a)
+}
+
+/// `-[NSTextTab initWithTextAlignment:location:options:]` with right alignment.
+pub unsafe fn send_tab(location: f64) -> Obj {
+    let options = send(class("NSDictionary"), "dictionary");
+    let function: unsafe extern "C" fn(Obj, Sel, isize, f64, Obj) -> Obj =
+        transmute(objc_msgSend as *const ());
+    function(
+        alloc("NSTextTab"),
+        selector("initWithTextAlignment:location:options:"),
+        2,
+        location,
+        options,
+    )
+}
+
+pub fn system_font_size() -> f64 {
+    13.0
+}
+
+pub unsafe fn send_void_two_floats(obj: Obj, sel: &str, a: f64, b: f64) {
+    let function: unsafe extern "C" fn(Obj, Sel, f64, f64) = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b);
+}
+
+/// `+timerWithTimeInterval:target:selector:userInfo:repeats:`
+type TimerFactory =
+    unsafe extern "C" fn(Obj, Sel, f64, Obj, Sel, Obj, bool) -> Obj;
+
+pub unsafe fn send_timer(
+    obj: Obj,
+    sel: &str,
+    interval: f64,
+    target: Obj,
+    action: Sel,
+    user_info: Obj,
+    repeats: bool,
+) -> Obj {
+    let function: TimerFactory = transmute(msg_send_ptr());
+    function(obj, selector(sel), interval, target, action, user_info, repeats)
+}
+
+pub unsafe fn send_attr_range(obj: Obj, sel: &str, name: Obj, value: Obj, loc: usize, len: usize) {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, Obj, usize, usize) =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), name, value, loc, len);
+}
+
+pub unsafe fn retain(obj: Obj) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel) -> Obj = transmute(objc_msgSend as *const ());
+    function(obj, selector("retain"))
+}
+
+pub unsafe fn release(obj: Obj) {
+    let function: unsafe extern "C" fn(Obj, Sel) = transmute(objc_msgSend as *const ());
+    function(obj, selector("release"));
+}

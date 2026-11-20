@@ -1,0 +1,17 @@
+[package]
+name = "vitals"
+version = "1.0.0"
+edition = "2021"
+description = "A macOS menu bar sensor monitor in the spirit of the GNOME Vitals extension"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "vitals"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
