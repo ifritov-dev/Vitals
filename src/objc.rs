@@ -308,3 +308,14 @@ pub unsafe fn send_void_range_point(obj: Obj, sel: &str, location: usize, length
         transmute(objc_msgSend as *const ());
     function(obj, selector(sel), location, length, x, y);
 }
+
+pub unsafe fn send_point_int(obj: Obj, sel: &str, index: usize) -> (f64, f64) {
+    let function: unsafe extern "C" fn(Obj, Sel, usize) -> (f64, f64) =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), index)
+}
+
+pub unsafe fn send_int_obj_result2(obj: Obj, sel: &str, arg: usize) -> usize {
+    let function: unsafe extern "C" fn(Obj, Sel, usize) -> usize = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), arg)
+}

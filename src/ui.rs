@@ -556,6 +556,22 @@ const COLUMN_GUTTER: f64 = 22.0;
 const ICON_WIDTH: f64 = 20.0;
 /// Square an icon is drawn into.
 const ICON_BOX: f64 = 14.0;
+/// Where every category name starts when the row has an icon.
+const ICON_SLOT: f64 = 22.0;
+
+/// How many menu-font spaces separate the icon from the name.
+fn icon_gap_spaces() -> usize {
+    unsafe {
+        let font = objc::send_float(objc::class("NSFont"), "menuFontOfSize:", 0.0);
+        let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
+        objc::send_void_obj_obj(attributes, "setObject:forKey:", font, objc::nsstring("NSFont"));
+        let space = text_width(objc::nsstring(" "), attributes);
+        if space <= 0.0 {
+            return 2;
+        }
+        ((ICON_SLOT - ICON_BOX) / space).round().max(1.0) as usize
+    }
+}
 /// Space between the category icon and its name.
 const ICON_GAP: &str = "\u{2009}\u{2009}\u{2009}\u{2009}";
 
@@ -621,14 +637,20 @@ fn populate(state: &mut AppState, menu: Obj) {
             let reading = state.store.get(category).clone();
             let item = menu_item(category.title(), "", 0);
             let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
-            set_row_title_with_symbol(
+            set_row_title(
                 item,
-                symbol_image(category, &reading),
                 category.title(),
                 if value.has_data() { &value.text } else { "No data" },
                 row_tab,
                 false,
             );
+            // The icon goes in the menu's own state column, which is a fixed
+            // slot at the left edge, so every row's icon and every row's name
+            // line up without the icon taking part in the title's layout.
+            if let Some(image) = symbol_image(category, &reading) {
+                objc::send_void_obj(item, "setOnStateImage:", image);
+                objc::send_void_int(item, "setState:", 1);
+            }
             let submenu = objc::send_obj(
                 objc::alloc("NSMenu"),
                 "initWithTitle:",
@@ -785,14 +807,20 @@ fn refresh_values(state: &mut AppState) {
                 continue;
             };
             let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
-            set_row_title_with_symbol(
+            set_row_title(
                 item,
-                symbol_image(category, &reading),
                 category.title(),
                 if value.has_data() { &value.text } else { "No data" },
                 row_tab,
                 false,
             );
+            // The icon goes in the menu's own state column, which is a fixed
+            // slot at the left edge, so every row's icon and every row's name
+            // line up without the icon taking part in the title's layout.
+            if let Some(image) = symbol_image(category, &reading) {
+                objc::send_void_obj(item, "setOnStateImage:", image);
+                objc::send_void_int(item, "setState:", 1);
+            }
         }
 
         // The sensor rows of the submenu that is on screen, if one is. The
@@ -1007,7 +1035,6 @@ impl Attributed {
         dim: bool,
     ) -> Obj {
         unsafe {
-            let text = format!("{left}\t{right}");
             let value_font = objc::send_obj_two_floats(
                 objc::class("NSFont"),
                 "monospacedDigitSystemFontOfSize:weight:",
@@ -1019,13 +1046,19 @@ impl Attributed {
                 objc::send_void_obj_obj(attributes, "setObject:forKey:", value_font, objc::nsstring("NSFont"));
                 attributes
             });
-            let tab_stop = (column_right - value_width).max(0.0);
+
+            // A tab stop placed right after an attachment is not honoured, so
+            // the icon column is a counted run of spaces in the menu font:
+            // every name then starts at the same x, whatever its symbol drew.
+            let gap = if symbol.is_some() { icon_gap_spaces() } else { 0 };
+            let text = format!("{}{left}\t{right}", " ".repeat(gap));
+
+            let value_stop = (column_right - value_width).max(ICON_SLOT + 1.0);
             let paragraph = objc::send(objc::alloc("NSMutableParagraphStyle"), "init");
-            let tab = objc::send_tab(tab_stop);
             let tabs = objc::send(objc::class("NSMutableArray"), "array");
-            objc::send_void_obj(tabs, "addObject:", tab);
+            objc::send_void_obj(tabs, "addObject:", objc::send_tab(value_stop));
             objc::send_void_obj(paragraph, "setTabStops:", tabs);
-            objc::send_void_float(paragraph, "setDefaultTabInterval:", tab_stop);
+            objc::send_void_float(paragraph, "setDefaultTabInterval:", value_stop);
 
             let string = objc::send_obj(
                 objc::alloc("NSMutableAttributedString"),
@@ -1043,16 +1076,7 @@ impl Attributed {
                 );
                 objc::send_void_obj_int(string, "insertAttributedString:atIndex:", piece, 0);
                 objc::release(attachment);
-                // A fixed gap, so every label starts at the same x no matter
-                // how wide its symbol draws.
-                let gap = objc::send_obj(
-                    objc::alloc("NSMutableAttributedString"),
-                    "initWithString:",
-                    objc::nsstring(ICON_GAP),
-                );
-                objc::send_void_obj_int(string, "insertAttributedString:atIndex:", gap, 1);
-                objc::release(gap);
-                icon_offset = 1 + ICON_GAP.chars().count();
+                icon_offset = 1;
             }
             let full_length = text.chars().count() + icon_offset;
             objc::send_attr_range(
@@ -1075,7 +1099,7 @@ impl Attributed {
             );
 
             if dim {
-                let value_start = icon_offset + left.chars().count() + 1;
+                let value_start = icon_offset + gap + left.chars().count() + 1;
                 objc::send_attr_range(
                     string,
                     "addAttribute:value:range:",
@@ -1208,6 +1232,24 @@ pub fn dump_menu() -> String {
                 .collect::<Vec<_>>()
                 .join(" ");
             out.push_str(&format!("\n## Icons\n   {icon_sizes}\n"));
+            let advances = ALL_CATEGORIES
+                .iter()
+                .filter_map(|category| symbol_image(*category, state.store.get(*category)))
+                .map(|image| {
+                    let attachment = objc::send(objc::alloc("NSTextAttachment"), "init");
+                    objc::send_void_obj(attachment, "setImage:", image);
+                    let piece = objc::send_obj(
+                        objc::class("NSAttributedString"),
+                        "attributedStringWithAttachment:",
+                        attachment,
+                    );
+                    let width = objc::send_size(piece, "size").width;
+                    objc::release(attachment);
+                    format!("{width:.1}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!("   advances: {advances}\n"));
             out.push_str(&format!(
                 "\n## Columns (value column ends at {:.1} pt)\n",
                 state.row_tab
@@ -1222,12 +1264,26 @@ pub fn dump_menu() -> String {
                 let text = if value.has_data() { &value.text } else { "No data" };
                 let label_width = text_width(objc::nsstring(category.title()), attrs);
                 let value_width = text_width(objc::nsstring(text), attrs);
-                let row = Attributed::row(category.title(), text, state.row_tab, false);
+                let symbol = symbol_image(category, reading);
+                let row = Attributed::row_with_symbol(
+                    symbol,
+                    category.title(),
+                    text,
+                    state.row_tab,
+                    false,
+                );
                 let row_width = objc::send_size(row, "size").width;
+                let name_index = if symbol.is_some() {
+                    1 + icon_gap_spaces()
+                } else {
+                    0
+                };
+                let name_x = unsafe { name_position(row, name_index) };
                 objc::release(row);
                 out.push_str(&format!(
-                    "   {:<12} label ends {:>6.1}, value starts {:>6.1}, gap {:>5.1}, ends {:>6.1}, row {:>6.1}\n",
+                    "   {:<12} name at {:>5.1}, label ends {:>6.1}, value starts {:>6.1}, gap {:>5.1}, ends {:>6.1}, row {:>6.1}\n",
                     category.title(),
+                    name_x,
                     label_width,
                     state.row_tab - value_width,
                     state.row_tab - value_width - label_width,
@@ -1574,4 +1630,26 @@ pub fn bench_menu() -> String {
             )
         })
     }
+}
+
+/// Where the category name actually starts in a rendered row, measured through
+/// the text system rather than guessed from the icon's width.
+unsafe fn name_position(row: Obj, index: usize) -> f64 {
+    let storage = objc::send_obj(objc::alloc("NSTextStorage"), "initWithAttributedString:", row);
+    let manager = objc::send(objc::alloc("NSLayoutManager"), "init");
+    objc::send_void_obj(storage, "addLayoutManager:", manager);
+    let container = objc::send_obj_size_int(
+        objc::alloc("NSTextContainer"),
+        "initWithContainerSize:",
+        400.0,
+        30.0,
+        0,
+    );
+    objc::send_void_obj(manager, "addTextContainer:", container);
+    let glyph = objc::send_int_obj_result2(manager, "glyphIndexForCharacterAtIndex:", index);
+    let x = objc::send_point_int(manager, "locationForGlyphAtIndex:", glyph).0;
+    objc::release(manager);
+    objc::release(storage);
+    objc::release(container);
+    x
 }
