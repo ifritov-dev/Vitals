@@ -1,4 +1,5 @@
 mod diag;
+mod login;
 mod model;
 mod objc;
 mod poller;
@@ -67,6 +68,33 @@ fn main() {
         ui::prepare_application();
         let text = ui::dump_menu();
         emit(&text, arg_value(&args, "--out"));
+        return;
+    }
+
+    let headless = args.iter().any(|a| {
+        a == "--selftest"
+            || a == "--dump"
+            || a == "--dump-menu"
+            || a == "--print-config"
+            || a == "--bench-menu"
+            || a == "--login-status"
+            || a.starts_with("--set-")
+            || a.starts_with("--render")
+    });
+    if !headless && !login::claim_single_instance() {
+        return;
+    }
+
+    if args.iter().any(|a| a == "--login-status") {
+        print!("start at login: {}\n", login::enabled());
+        return;
+    }
+
+    if let Some(value) = arg_value(&args, "--set-login") {
+        match login::set(value == "on") {
+            Ok(()) => println!("start at login: {}", login::enabled()),
+            Err(error) => println!("failed: {error}"),
+        }
         return;
     }
 

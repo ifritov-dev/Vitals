@@ -141,7 +141,17 @@ impl CategoryReading {
 }
 
 pub mod format {
-    use super::Reading;
+    use super::{Category, Reading};
+
+    /// One sensor's reading, formatted for its category.
+    pub fn for_category(category: Category, value: f64) -> Reading {
+        match category {
+            Category::Temperature => temperature(value),
+            Category::Voltage => voltage(value),
+            Category::Fan => rpm(value),
+            _ => percent(value),
+        }
+    }
 
     pub fn temperature(celsius: f64) -> Reading {
         Reading::new(

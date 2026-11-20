@@ -232,8 +232,15 @@ impl SmcService {
 
     /// Re-reads every cached key: key -> value.
     pub fn read_values(&self) -> Vec<(String, f64)> {
+        self.read_values_where(&|_| true)
+    }
+
+    /// Reads the keys a filter accepts. Each key is two calls into the driver,
+    /// so reading only the categories that are on screen is most of the work
+    /// saved on an idle machine.
+    pub fn read_values_where(&self, keep: &dyn Fn(&Spec) -> bool) -> Vec<(String, f64)> {
         let mut values = Vec::with_capacity(self.specs.len());
-        for spec in &self.specs {
+        for spec in self.specs.iter().filter(|spec| keep(spec)) {
             let Some(bytes) = self.read_bytes(&spec.key, spec.size as u32) else {
                 continue;
             };

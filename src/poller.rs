@@ -7,24 +7,37 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
+use crate::model::Category;
 use crate::store::{SensorStore, Snapshot};
 
+/// What a poll should cover: everything, or just the categories on screen.
+enum Request {
+    Full,
+    Shown(Vec<(Category, Option<String>)>),
+}
+
 pub struct Poller {
-    requests: Sender<()>,
+    requests: Sender<Request>,
     results: Receiver<Snapshot>,
 }
 
 impl Poller {
     pub fn start() -> Poller {
-        let (request_tx, request_rx) = channel::<()>();
+        let (request_tx, request_rx) = channel::<Request>();
         let (result_tx, result_rx) = channel::<Snapshot>();
         std::thread::spawn(move || {
             let mut store = SensorStore::new();
-            while request_rx.recv().is_ok() {
+            while let Ok(first) = request_rx.recv() {
+                let mut latest = first;
                 // Requests that arrived while this poll ran are already
                 // answered by it; one poll covers them all.
-                while matches!(request_rx.try_recv(), Ok(())) {}
-                store.refresh();
+                while let Ok(next) = request_rx.try_recv() {
+                    latest = next;
+                }
+                match latest {
+                    Request::Full => store.refresh(),
+                    Request::Shown(shown) => store.refresh_shown(&shown),
+                }
                 if result_tx.send(store.snapshot()).is_err() {
                     break;
                 }
@@ -36,8 +49,14 @@ impl Poller {
         }
     }
 
-    pub fn request(&self) {
-        let _ = self.requests.send(());
+    /// Asks for a poll. `shown` is ignored when `full` is set.
+    pub fn request(&self, full: bool, shown: &[(Category, Option<String>)]) {
+        let request = if full {
+            Request::Full
+        } else {
+            Request::Shown(shown.to_vec())
+        };
+        let _ = self.requests.send(request);
     }
 
     /// The newest finished poll, if one landed since the last call.

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::diag;
 use crate::model::{Category, CategoryReading, ALL_CATEGORIES};
@@ -17,6 +17,7 @@ use crate::prefs::Prefs;
 use crate::store::SensorStore;
 
 const TAG_QUIT: isize = -22;
+const TAG_LOGIN: isize = -23;
 const TAG_INTERVAL_BASE: isize = -30;
 
 struct AppState {
@@ -42,6 +43,15 @@ struct AppState {
     open_submenu: Option<Category>,
     /// Reads sensors off the main thread; only the GUI runs one.
     poller: Option<crate::poller::Poller>,
+    /// Fires once per refresh interval.
+    tick_timer: Obj,
+    /// One-shot timer that picks up the snapshot a tick asked for.
+    collect_timer: Obj,
+    /// What the menu bar currently says, so an unchanged reading is not
+    /// redrawn.
+    last_title: String,
+    /// The Start at Login row, so its checkmark can follow the toggle.
+    login_item: Obj,
 }
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
@@ -86,23 +96,18 @@ pub fn run() {
             submenus: HashMap::new(),
             open_submenu: None,
             poller: Some(crate::poller::Poller::start()),
+            tick_timer: std::ptr::null_mut(),
+            collect_timer: std::ptr::null_mut(),
+            last_title: String::new(),
+            login_item: std::ptr::null_mut(),
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
 
         with_state(|state| rebuild_status_items(state));
 
-        let timer = objc::send_timer(
-            objc::class("NSTimer"),
-            "timerWithTimeInterval:target:selector:userInfo:repeats:",
-            0.5,
-            controller,
-            objc::selector("tick:"),
-            std::ptr::null_mut(),
-            true,
-        );
+        with_state(schedule_ticks);
         let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
-        objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, NSRunLoopCommonModes);
 
         if std::env::args().any(|a| a == "--demo-open") {
             let opener = objc::send_timer(
@@ -167,6 +172,12 @@ unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
     with_state(|state| {
         state.open_menu = menu;
         state.open_submenu = state.submenus.get(&(menu as usize)).copied();
+        if state.open_submenu.is_none() {
+            if let Some(poller) = state.poller.as_ref() {
+                poller.request(true, &[]);
+                schedule_collect(state);
+            }
+        }
         // A menu tracks in NSEventTrackingRunLoopMode, where the regular
         // ticker does not run; this one keeps the open dropdown live.
         let controller = state.controller;
@@ -175,7 +186,7 @@ unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
             "timerWithTimeInterval:target:selector:userInfo:repeats:",
             0.4,
             controller,
-            objc::selector("tick:"),
+            objc::selector("collect:"),
             std::ptr::null_mut(),
             true,
         );
@@ -251,11 +262,12 @@ fn make_controller() -> Obj {
         let cls = objc::objc_allocateClassPair(objc::class("NSObject"), name.as_ptr(), 0);
         let void_obj = CString::new("v@:@").unwrap();
 
-        let methods: [(&str, *const ()); 8] = [
+        let methods: [(&str, *const ()); 9] = [
             ("tick:", tick_imp as *const ()),
             ("demoOpen:", demo_open as *const ()),
             ("demoClose:", demo_close as *const ()),
             ("demoActions:", demo_actions as *const ()),
+            ("collect:", collect as *const ()),
             ("menuNeedsUpdate:", menu_needs_update as *const ()),
             ("menuWillOpen:", menu_will_open as *const ()),
             ("menuDidClose:", menu_did_close as *const ()),
@@ -299,6 +311,7 @@ fn rebuild_status_items(state: &mut AppState) {
         state.status_items.push(item);
         let _ = categories;
         state.last_signature = signature(&state.prefs);
+        state.last_title.clear();
         update_status_titles(state);
     }
 }
@@ -322,6 +335,18 @@ unsafe fn button_of(item: Obj) -> Option<Obj> {
 fn update_status_titles(state: &mut AppState) {
     unsafe {
         let categories = state.prefs.ordered_menu_bar();
+        let stated = categories
+            .iter()
+            .map(|category| {
+                let reading = state.store.get(*category);
+                let value = reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
+                format!("{}={};", category.key(), value.compact)
+            })
+            .collect::<String>();
+        if stated == state.last_title && !state.status_items.is_empty() {
+            return;
+        }
+        state.last_title = stated;
         {
             let Some(item) = state.status_items.first() else {
                 return;
@@ -372,36 +397,95 @@ fn update_status_titles(state: &mut AppState) {
 // MARK: - Tick
 
 fn tick(state: &mut AppState) {
-    let due = state.last_refresh.elapsed() >= Duration::from_secs_f64(state.prefs.interval);
-    let mut fresh = false;
-    if due {
-        match state.poller.as_ref() {
-            // The poll itself runs on the worker thread; the tick only asks
-            // for it, so the menu keeps tracking the pointer while it runs.
-            Some(poller) => poller.request(),
-            None => {
-                state.store.refresh();
-                fresh = true;
+    // The poll runs on the worker thread, so this only asks for one and then
+    // comes back for the result. Nothing is read on the main thread.
+    match state.poller.as_ref() {
+        Some(poller) => {
+            let shown = state
+                .prefs
+                .ordered_menu_bar()
+                .into_iter()
+                .map(|category| (category, state.prefs.selection(category).cloned()))
+                .collect::<Vec<_>>();
+            poller.request(!state.open_menu.is_null(), &shown);
+            schedule_collect(state);
+        }
+        None => {
+            state.store.refresh();
+            show_latest(state);
+        }
+    }
+    state.last_refresh = Instant::now();
+}
+
+/// Picks up a snapshot the previous tick asked for.
+unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
+    with_state(|state| {
+        state.collect_timer = std::ptr::null_mut();
+        if let Some(poller) = state.poller.as_ref() {
+            if let Some(snapshot) = poller.take_latest() {
+                state.store.apply(snapshot);
             }
         }
-        state.last_refresh = Instant::now();
-    }
-    if let Some(poller) = state.poller.as_ref() {
-        if let Some(snapshot) = poller.take_latest() {
-            state.store.apply(snapshot);
-            fresh = true;
-        }
-    }
+        show_latest(state);
+    });
+}
+
+fn show_latest(state: &mut AppState) {
     if signature(&state.prefs) != state.last_signature {
         rebuild_status_items(state);
-        return;
-    }
-    if !fresh {
         return;
     }
     update_status_titles(state);
     if !state.open_menu.is_null() {
         refresh_values(state);
+    }
+}
+
+/// Arms the one-shot timer that collects the poll requested a moment ago.
+fn schedule_collect(state: &mut AppState) {
+    unsafe {
+        if !state.collect_timer.is_null() {
+            objc::send_void(state.collect_timer, "invalidate");
+        }
+        let timer = objc::send_timer(
+            objc::class("NSTimer"),
+            "timerWithTimeInterval:target:selector:userInfo:repeats:",
+            0.4,
+            state.controller,
+            objc::selector("collect:"),
+            std::ptr::null_mut(),
+            false,
+        );
+        let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
+        objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, NSRunLoopCommonModes);
+        state.collect_timer = objc::retain(timer);
+    }
+}
+
+/// One timer per refresh interval, with tolerance so the system can hold the
+/// wakeup until it has other work to do.
+fn schedule_ticks(state: &mut AppState) {
+    unsafe {
+        if !state.tick_timer.is_null() {
+            objc::send_void(state.tick_timer, "invalidate");
+            objc::release(state.tick_timer);
+            state.tick_timer = std::ptr::null_mut();
+        }
+        let interval = state.prefs.interval;
+        let timer = objc::send_timer(
+            objc::class("NSTimer"),
+            "timerWithTimeInterval:target:selector:userInfo:repeats:",
+            interval,
+            state.controller,
+            objc::selector("tick:"),
+            std::ptr::null_mut(),
+            true,
+        );
+        objc::send_void_float(timer, "setTolerance:", (interval * 0.25).max(0.2));
+        let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
+        objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, NSRunLoopCommonModes);
+        state.tick_timer = objc::retain(timer);
     }
 }
 
@@ -563,6 +647,15 @@ fn populate(state: &mut AppState, menu: Obj) {
         }
         objc::send_void_obj(interval_item, "setSubmenu:", interval_menu);
         objc::send_void_obj(menu, "addItem:", interval_item);
+
+        let login_item = action_item("Start at Login", state.controller, TAG_LOGIN);
+        objc::send_void_int(
+            login_item,
+            "setState:",
+            if crate::login::enabled() { 1 } else { 0 },
+        );
+        objc::send_void_obj(menu, "addItem:", login_item);
+        state.login_item = login_item;
 
         objc::send_void_obj(menu, "addItem:", objc::send(objc::class("NSMenuItem"), "separatorItem"));
         let quit = action_item("Quit Vitals", state.controller, TAG_QUIT);
@@ -737,6 +830,19 @@ fn dispatch(state: &mut AppState, tag: isize) {
         return;
     }
     match tag {
+        TAG_LOGIN => {
+            let _ = crate::login::set(!crate::login::enabled());
+            if !state.login_item.is_null() {
+                unsafe {
+                    objc::send_void_int(
+                        state.login_item,
+                        "setState:",
+                        if crate::login::enabled() { 1 } else { 0 },
+                    );
+                }
+            }
+            return;
+        }
         TAG_QUIT => unsafe {
             let app = objc::send(objc::class("NSApplication"), "sharedApplication");
             objc::send_void_obj(app, "terminate:", std::ptr::null_mut());
@@ -744,6 +850,7 @@ fn dispatch(state: &mut AppState, tag: isize) {
         other if other <= -31 && other >= -40 => {
             let seconds = (-other - 30) as f64;
             state.prefs.set_interval(seconds);
+            schedule_ticks(state);
         }
         _ => {}
     }
@@ -988,6 +1095,10 @@ pub fn dump_menu() -> String {
             submenus: HashMap::new(),
             open_submenu: None,
             poller: None,
+            tick_timer: std::ptr::null_mut(),
+            collect_timer: std::ptr::null_mut(),
+            last_title: String::new(),
+            login_item: std::ptr::null_mut(),
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -1155,6 +1266,10 @@ pub fn render_rows(path: &str) {
             submenus: HashMap::new(),
             open_submenu: None,
             poller: None,
+            tick_timer: std::ptr::null_mut(),
+            collect_timer: std::ptr::null_mut(),
+            last_title: String::new(),
+            login_item: std::ptr::null_mut(),
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -1264,6 +1379,10 @@ pub fn bench_menu() -> String {
             submenus: HashMap::new(),
             open_submenu: None,
             poller: None,
+            tick_timer: std::ptr::null_mut(),
+            collect_timer: std::ptr::null_mut(),
+            last_title: String::new(),
+            login_item: std::ptr::null_mut(),
             last_refresh: Instant::now(),
             last_signature: String::new(),
         });
@@ -1300,15 +1419,49 @@ pub fn bench_menu() -> String {
             }
             let sensor_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
 
+            let shown = state
+                .prefs
+                .ordered_menu_bar()
+                .into_iter()
+                .map(|category| (category, state.prefs.selection(category).cloned()))
+                .collect::<Vec<_>>();
+            let start = Instant::now();
+            for _ in 0..5 {
+                state.store.refresh_shown(&shown);
+            }
+            let shown_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+
+            let one_sensor = vec![(Category::Temperature, Some("TAOL".to_string()))];
+            let start = Instant::now();
+            for _ in 0..5 {
+                state.store.refresh_shown(&one_sensor);
+            }
+            let single_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
+
             let rows = objc::send_int_result(
                 objc::send(menu, "itemArray"),
                 "count",
             );
+            let sample = shown
+                .iter()
+                .map(|(category, selection)| {
+                    let reading = state.store.get(*category);
+                    format!(
+                        "{}={}",
+                        category.title(),
+                        reading.reading_for(selection.as_deref()).text
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
                 "dropdown build: {dropdown_ms:.2} ms ({rows} rows)\n\
                  temperature submenu build: {submenu_ms:.2} ms ({} rows)\n\
                  live refresh: {refresh_ms:.2} ms\n\
-                 sensor poll: {sensor_ms:.2} ms\n",
+                 sensor poll (all nine): {sensor_ms:.2} ms\n\
+                 sensor poll (menu bar only): {shown_ms:.2} ms\n\
+                 sensor poll (one sensor): {single_ms:.2} ms\n\
+                 menu bar after a subset poll: {sample}\n",
                 reading.sensors.len() + 2
             )
         })

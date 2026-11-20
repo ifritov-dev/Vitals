@@ -254,3 +254,19 @@ pub unsafe fn send_obj_int_obj(obj: Obj, sel: &str, a: isize, b: Obj) -> Obj {
     let function: unsafe extern "C" fn(Obj, Sel, isize, Obj) -> Obj = transmute(objc_msgSend as *const ());
     function(obj, selector(sel), a, b)
 }
+
+pub unsafe fn send_bool_error(obj: Obj, sel: &str, error: *mut Obj) -> bool {
+    let function: unsafe extern "C" fn(Obj, Sel, *mut Obj) -> bool = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), error)
+}
+
+pub unsafe fn nsstring_to_string(value: Obj) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let utf8 = send(value, "UTF8String") as *const std::ffi::c_char;
+    if utf8.is_null() {
+        return String::new();
+    }
+    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+}

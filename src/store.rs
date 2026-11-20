@@ -12,6 +12,13 @@ pub struct Snapshot {
     pub polled_keys: usize,
 }
 
+fn smc_category(category: Category) -> bool {
+    matches!(
+        category,
+        Category::Temperature | Category::Voltage | Category::Fan
+    )
+}
+
 pub struct SensorStore {
     smc: Option<SmcService>,
     system: SystemSensors,
@@ -59,23 +66,97 @@ impl SensorStore {
     }
 
     pub fn refresh(&mut self) {
+        self.refresh_categories(&ALL_CATEGORIES);
+    }
+
+    /// Refreshes what the menu bar shows. A category showing one sensor reads
+    /// that single key; only a category showing its average needs the whole
+    /// family, because the average is over all of them.
+    pub fn refresh_shown(&mut self, shown: &[(Category, Option<String>)]) {
+        let exact: Vec<&str> = shown
+            .iter()
+            .filter(|(category, sensor)| sensor.is_some() && smc_category(*category))
+            .filter_map(|(_, sensor)| sensor.as_deref())
+            .collect();
+        let averages: Vec<Category> = shown
+            .iter()
+            .filter(|(category, sensor)| sensor.is_none() || !smc_category(*category))
+            .map(|(category, _)| *category)
+            .collect();
+
+        let keep = |spec: &crate::smc::Spec| {
+            if exact.iter().any(|key| spec.key == *key) {
+                return true;
+            }
+            match spec.key.as_bytes().first() {
+                Some(b'T') => averages.contains(&Category::Temperature),
+                Some(b'V') => averages.contains(&Category::Voltage),
+                Some(b'F') => averages.contains(&Category::Fan),
+                Some(b'B') => averages.contains(&Category::Battery),
+                _ => false,
+            }
+        };
         let values = self
             .smc
             .as_ref()
-            .map(|service| service.read_values())
+            .map(|service| service.read_values_where(&keep))
             .unwrap_or_default();
 
-        let mut fresh = Vec::with_capacity(ALL_CATEGORIES.len());
-        fresh.push(sensors::temperature(&values));
-        fresh.push(sensors::voltage(&values));
-        fresh.push(sensors::fan(&values));
-        fresh.push(self.system.memory());
-        fresh.push(self.system.processor());
-        fresh.push(self.system.system_load());
-        fresh.push(self.system.network());
-        fresh.push(self.system.storage());
-        fresh.push(self.system.battery(&values));
-        self.snapshot = fresh;
+        for (category, selection) in shown {
+            let Some(id) = selection.as_deref().filter(|_| smc_category(*category)) else {
+                self.refresh_category(*category, &values);
+                continue;
+            };
+            let Some(value) = values.iter().find(|(key, _)| key == id).map(|(_, v)| *v) else {
+                continue;
+            };
+            let mut reading = self.snapshot[category.index()].clone();
+            let Some(sensor) = reading.sensors.iter_mut().find(|sensor| sensor.id == id) else {
+                continue;
+            };
+            sensor.reading = crate::model::format::for_category(*category, value);
+            self.snapshot[category.index()] = reading;
+        }
+    }
+
+    fn refresh_category(&mut self, category: Category, values: &[(String, f64)]) {
+        let reading = match category {
+            Category::Temperature => sensors::temperature(values),
+            Category::Voltage => sensors::voltage(values),
+            Category::Fan => sensors::fan(values),
+            Category::Memory => self.system.memory(),
+            Category::Processor => self.system.processor(),
+            Category::System => self.system.system_load(),
+            Category::Network => self.system.network(),
+            Category::Storage => self.system.storage(),
+            Category::Battery => self.system.battery(values),
+        };
+        self.snapshot[category.index()] = reading;
+    }
+
+    /// Refreshes only the requested categories and keeps the last reading of
+    /// the rest. The menu bar usually shows two or three categories, and SMC
+    /// keys for the other six cost a driver call each.
+    pub fn refresh_categories(&mut self, wanted: &[Category]) {
+        let wants = |category: Category| wanted.contains(&category);
+        let keep = |spec: &crate::smc::Spec| match spec.key.as_bytes().first() {
+            Some(b'T') => wants(Category::Temperature),
+            Some(b'V') => wants(Category::Voltage),
+            Some(b'F') => wants(Category::Fan),
+            Some(b'B') => wants(Category::Battery),
+            _ => false,
+        };
+        let values = self
+            .smc
+            .as_ref()
+            .map(|service| service.read_values_where(&keep))
+            .unwrap_or_default();
+
+        for category in ALL_CATEGORIES {
+            if wants(category) {
+                self.refresh_category(category, &values);
+            }
+        }
     }
 
     pub fn get(&self, category: Category) -> &CategoryReading {
