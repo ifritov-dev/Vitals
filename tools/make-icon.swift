@@ -1,13 +1,12 @@
 // Draws the app icon and writes Vitals.iconset, then an .icns.
 //
 // macOS icon grid: a continuous-corner square with margins, a dark graphite
-// gradient, a hairline highlight along the top edge. The glyph is the pulse in
-// tools/pulse.png, drawn white.
+// gradient, a hairline highlight along the top edge. The glyph is Phosphor's
+// pulse, drawn white.
 
 import AppKit
 
 let outputDir = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "packaging"
-let glyphFile = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "tools/pulse.png"
 
 // MARK: - Squircle
 
@@ -40,32 +39,14 @@ func continuousSquare(_ rect: CGRect, radius r: CGFloat) -> CGPath {
 
 // MARK: - Glyph
 
-/// The pulse drawn white: the source art is a black glyph on transparency, so
-/// fill a canvas white and keep it only where the source has ink.
-func whiteGlyph(_ path: String) -> (image: CGImage, ink: CGRect)? {
-    guard let source = NSImage(contentsOfFile: path),
-          let bitmap = source.representations.first as? NSBitmapImageRep,
-          let cgSource = bitmap.cgImage else { return nil }
-    let w = cgSource.width, h = cgSource.height
-    let space = CGColorSpaceCreateDeviceRGB()
-    guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
-                                  bytesPerRow: 0, space: space,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-    else { return nil }
-    context.setFillColor(NSColor.white.cgColor)
-    context.fill(CGRect(x: 0, y: 0, width: w, height: h))
-    context.setBlendMode(.destinationIn)
-    context.draw(cgSource, in: CGRect(x: 0, y: 0, width: w, height: h))
-
-    var minX = w, maxX = -1, minY = h, maxY = -1
-    for y in 0..<h { for x in 0..<w {
-        guard let a = bitmap.colorAt(x: x, y: y)?.alphaComponent, a > 0.35 else { continue }
-        minX = min(minX, x); maxX = max(maxX, x)
-        minY = min(minY, y); maxY = max(maxY, y)
-    }}
-    guard maxX >= 0, let image = context.makeImage() else { return nil }
-    return (image, CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1))
-}
+/// Phosphor's pulse, drawn as a stroked centreline on its 256-unit grid so the
+/// mark stays sharp at every icon size. Coordinates were fitted against the
+/// reference art: 224 units wide, 180 tall, stroke 16 with round caps.
+let pulseCentreline: [CGPoint] = [
+    CGPoint(x: 24, y: 128), CGPoint(x: 54, y: 128), CGPoint(x: 96, y: 45),
+    CGPoint(x: 164, y: 208), CGPoint(x: 200, y: 128), CGPoint(x: 232, y: 128),
+]
+let pulseStroke: CGFloat = 17
 
 // MARK: - Icon
 
@@ -92,59 +73,40 @@ func drawIcon(size: CGFloat) -> NSBitmapImageRep {
     cg.clip()
     let body = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                           colors: [
-                              NSColor(srgbRed: 0.20, green: 0.24, blue: 0.28, alpha: 1).cgColor,
-                              NSColor(srgbRed: 0.07, green: 0.08, blue: 0.10, alpha: 1).cgColor,
-                          ] as CFArray, locations: [0, 1])!
+                              NSColor(srgbRed: 0.24, green: 0.28, blue: 0.33, alpha: 1).cgColor,
+                              NSColor(srgbRed: 0.10, green: 0.12, blue: 0.14, alpha: 1).cgColor,
+                              NSColor(srgbRed: 0.05, green: 0.06, blue: 0.07, alpha: 1).cgColor,
+                          ] as CFArray, locations: [0, 0.55, 1])!
     cg.drawLinearGradient(body,
                           start: CGPoint(x: rect.midX, y: rect.maxY),
                           end: CGPoint(x: rect.midX, y: rect.minY),
                           options: [])
-    let highlight = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                               colors: [
-                                   NSColor(white: 1, alpha: 0.16).cgColor,
-                                   NSColor(white: 1, alpha: 0).cgColor,
-                               ] as CFArray, locations: [0, 1])!
-    cg.drawLinearGradient(highlight,
-                          start: CGPoint(x: rect.midX, y: rect.maxY),
-                          end: CGPoint(x: rect.midX, y: rect.midY),
-                          options: [])
+    // Hairline along the edge, brighter at the top, so the shape sits on any
+    // wallpaper without a hard outline.
+    cg.addPath(shape)
+    cg.setLineWidth(max(1, size * 0.007))
+    cg.setStrokeColor(NSColor(white: 1, alpha: 0.16).cgColor)
+    cg.strokePath()
     cg.restoreGState()
 
-    // Hairline edge, light at the top and fading out by the bottom.
-    let edge = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                          colors: [
-                              NSColor(white: 1, alpha: 0.22).cgColor,
-                              NSColor(white: 1, alpha: 0.05).cgColor,
-                          ] as CFArray, locations: [0, 1])!
+    // The pulse, centred and 54 % of the body wide.
+    let ink = CGRect(x: 24 - pulseStroke / 2, y: 45 - pulseStroke / 2,
+                     width: 208 + pulseStroke, height: 163 + pulseStroke)
+    let scale = rect.width * 0.56 / ink.width
     cg.saveGState()
-    cg.addPath(shape)
-    cg.clip()
-    cg.addPath(shape)
-    cg.setLineWidth(max(1, size * 0.005))
-    cg.replacePathWithStrokedPath()
-    cg.clip()
-    cg.drawLinearGradient(edge,
-                          start: CGPoint(x: rect.midX, y: rect.maxY),
-                          end: CGPoint(x: rect.midX, y: rect.minY),
-                          options: [])
+    cg.translateBy(x: rect.midX, y: rect.midY)
+    cg.scaleBy(x: scale, y: -scale)
+    cg.translateBy(x: -ink.midX, y: -ink.midY)
+    let glyph = CGMutablePath()
+    glyph.move(to: pulseCentreline[0])
+    for point in pulseCentreline.dropFirst() { glyph.addLine(to: point) }
+    cg.addPath(glyph)
+    cg.setLineWidth(pulseStroke)
+    cg.setLineCap(.round)
+    cg.setLineJoin(.round)
+    cg.setStrokeColor(NSColor.white.cgColor)
+    cg.strokePath()
     cg.restoreGState()
-
-    // The pulse glyph: the art's ink box, centred at 54 % of the body width.
-    if let glyph = whiteGlyph(glyphFile) {
-        let ink = glyph.ink
-        let scale = rect.width * 0.54 / ink.width
-        let dest = CGRect(x: rect.midX - (ink.midX) * scale,
-                          y: rect.midY - (CGFloat(glyph.image.height) - ink.midY) * scale,
-                          width: CGFloat(glyph.image.width) * scale,
-                          height: CGFloat(glyph.image.height) * scale)
-        cg.saveGState()
-        cg.interpolationQuality = .high
-        cg.setShadow(offset: CGSize(width: 0, height: -size * 0.008),
-                     blur: size * 0.025,
-                     color: NSColor(white: 0, alpha: 0.5).cgColor)
-        cg.draw(glyph.image, in: dest)
-        cg.restoreGState()
-    }
 
     NSGraphicsContext.restoreGraphicsState()
     return rep
