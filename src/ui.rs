@@ -1234,6 +1234,16 @@ pub fn dump_menu() -> String {
                 diag::selection_summary(&state.prefs)
             ));
             fill_all_submenus(state);
+            let icon_sizes = ALL_CATEGORIES
+                .iter()
+                .filter_map(|category| symbol_image(*category, state.store.get(*category)))
+                .map(|image| {
+                    let size = objc::send_size(image, "size");
+                    format!("{:.0}x{:.0}", size.width, size.height)
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!("\n## Icons\n   {icon_sizes}\n"));
             out.push_str(&format!(
                 "\n## Columns (value column ends at {:.1} pt)\n",
                 state.row_tab
