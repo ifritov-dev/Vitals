@@ -554,6 +554,8 @@ fn column_right_with(labels: &[String], values: &[String], extra: f64) -> f64 {
 const COLUMN_GUTTER: f64 = 22.0;
 /// Room the leading category icon takes in the dropdown's label column.
 const ICON_WIDTH: f64 = 20.0;
+/// Space between the category icon and its name.
+const ICON_GAP: &str = "\u{2009}\u{2009}\u{2009}";
 
 /// Values are drawn in the monospaced-digit font, so they have to be measured
 /// in it too; the menu font is narrower and would under-reserve the column.
@@ -1007,6 +1009,19 @@ impl Attributed {
             if let Some(image) = symbol {
                 let attachment = objc::send(objc::alloc("NSTextAttachment"), "init");
                 objc::send_void_obj(attachment, "setImage:", image);
+                // Symbols draw at their own widths; a fixed box is what keeps
+                // every label starting at the same x.
+                objc::send_void_rect(
+                    attachment,
+                    "setBounds:",
+                    // Square, matching the image, so no symbol is stretched.
+                    &objc::CgRect {
+                        x: 0.0,
+                        y: -3.0,
+                        width: 14.0,
+                        height: 14.0,
+                    },
+                );
                 let piece = objc::send_obj(
                     objc::class("NSAttributedString"),
                     "attributedStringWithAttachment:",
@@ -1014,7 +1029,16 @@ impl Attributed {
                 );
                 objc::send_void_obj_int(string, "insertAttributedString:atIndex:", piece, 0);
                 objc::release(attachment);
-                icon_offset = 1;
+                // A fixed gap, so every label starts at the same x no matter
+                // how wide its symbol draws.
+                let gap = objc::send_obj(
+                    objc::alloc("NSMutableAttributedString"),
+                    "initWithString:",
+                    objc::nsstring(ICON_GAP),
+                );
+                objc::send_void_obj_int(string, "insertAttributedString:atIndex:", gap, 1);
+                objc::release(gap);
+                icon_offset = 1 + ICON_GAP.chars().count();
             }
             let full_length = text.chars().count() + icon_offset;
             objc::send_attr_range(

@@ -270,3 +270,16 @@ pub unsafe fn nsstring_to_string(value: Obj) -> String {
     }
     std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
 }
+
+#[repr(C)]
+pub struct CgRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+pub unsafe fn send_void_rect(obj: Obj, sel: &str, rect: &CgRect) {
+    let function: unsafe extern "C" fn(Obj, Sel, *const CgRect) = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), rect);
+}
