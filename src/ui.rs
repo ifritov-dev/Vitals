@@ -555,7 +555,7 @@ const COLUMN_GUTTER: f64 = 22.0;
 /// Room the leading category icon takes in the dropdown's label column.
 const ICON_WIDTH: f64 = 20.0;
 /// Space between the category icon and its name.
-const ICON_GAP: &str = "\u{2009}\u{2009}\u{2009}";
+const ICON_GAP: &str = "\u{2009}\u{2009}\u{2009}\u{2009}";
 
 /// Values are drawn in the monospaced-digit font, so they have to be measured
 /// in it too; the menu font is narrower and would under-reserve the column.
@@ -1009,19 +1009,6 @@ impl Attributed {
             if let Some(image) = symbol {
                 let attachment = objc::send(objc::alloc("NSTextAttachment"), "init");
                 objc::send_void_obj(attachment, "setImage:", image);
-                // Symbols draw at their own widths; a fixed box is what keeps
-                // every label starting at the same x.
-                objc::send_void_rect(
-                    attachment,
-                    "setBounds:",
-                    // Square, matching the image, so no symbol is stretched.
-                    &objc::CgRect {
-                        x: 0.0,
-                        y: -3.0,
-                        width: 14.0,
-                        height: 14.0,
-                    },
-                );
                 let piece = objc::send_obj(
                     objc::class("NSAttributedString"),
                     "attributedStringWithAttachment:",
