@@ -19,4 +19,7 @@ path = "src/main.rs"
 
 [profile.release]
 lto = true
-strip = true
+# Cargo's default here strips debug info through the toolchain's rust-objcopy,
+# which cannot load its own library on this machine. The bundle is stripped
+# with the system strip in `make app` instead.
+strip = "none"

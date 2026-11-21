@@ -181,7 +181,7 @@ impl SensorStore {
             Category::System => self.system.system_load(),
             Category::Network => self.system.network(),
             Category::Storage => self.system.storage(),
-            Category::Battery => sensors::battery::battery(values),
+            Category::Battery => sensors::battery::battery(),
         };
         self.snapshot[category.index()] = reading;
     }

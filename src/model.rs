@@ -76,13 +76,13 @@ const _: () = {
 
 /// The category an SMC key belongs to, by its first byte. This is the one
 /// place the mapping lives: enumeration, the store's key filters and the
-/// sensor builders all ask here.
+/// sensor builders all ask here. Battery keys are absent on purpose: the
+/// power source description is the only source that reports it correctly.
 pub fn category_for_key(key: &str) -> Option<Category> {
     match key.as_bytes().first()? {
         b'T' => Some(Category::Temperature),
         b'V' => Some(Category::Voltage),
         b'F' => Some(Category::Fan),
-        b'B' => Some(Category::Battery),
         _ => None,
     }
 }

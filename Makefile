@@ -21,6 +21,10 @@ app: build
 	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources
 	@touch dist/.metadata_never_index
 	cp $(RELEASE_BIN) $(BUNDLE)/Contents/MacOS/$(APP_NAME)
+	# The system strip rather than cargo's: cargo strips through the toolchain's
+	# rust-objcopy, which on this machine cannot load its own libLLVM.dylib. The
+	# bundle is signed below, so the signature covers what actually ships.
+	/usr/bin/strip -x $(BUNDLE)/Contents/MacOS/$(APP_NAME)
 	cp packaging/Info.plist $(BUNDLE)/Contents/Info.plist
 	cp packaging/Phosphor.ttf $(BUNDLE)/Contents/Resources/Phosphor.ttf
 	cp packaging/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns

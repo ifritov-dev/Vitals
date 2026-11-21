@@ -106,6 +106,23 @@ pub unsafe fn send_size(obj: Obj, sel: &str) -> NSSize {
     function(obj, selector(sel))
 }
 
+/// `NSRect`: an origin and a size, so four doubles. A value that big comes
+/// back in memory, not in registers, so reading one through `send_size` takes
+/// two unrelated words — which is how a status item's height read as zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NSRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+pub unsafe fn send_rect(obj: Obj, sel: &str) -> NSRect {
+    let function: unsafe extern "C" fn(Obj, Sel) -> NSRect = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel))
+}
+
 pub unsafe fn send_void(obj: Obj, sel: &str) {
     let function: unsafe extern "C" fn(Obj, Sel) = transmute(objc_msgSend as *const ());
     function(obj, selector(sel))

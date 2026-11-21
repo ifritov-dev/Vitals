@@ -13,9 +13,24 @@ extern "C" {
     fn CFRelease(cf: *mut c_void);
 }
 
-pub fn battery(smc: &[(String, f64)]) -> CategoryReading {
-        let lookup = |key: &str| smc.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
+/// Voltage, current and the power they make, from the figures the power source
+/// description reports.
+///
+/// A current of zero means "not reported", not "no draw": a charging Mac says
+/// 0 there while pulling several amps, so a zero yields no electrical rows at
+/// all rather than a plausible-looking 0.0 W. The SMC's `B0AV`/`B0AC` are not
+/// a fallback for either — on Apple Silicon the first is not millivolts (it
+/// read 19.76 V and 44.85 V on one machine) and the second sits at 0.
+pub(crate) fn electrical(
+    millivolts: Option<isize>,
+    milliamps: Option<isize>,
+) -> Option<(f64, f64, f64)> {
+    let volts = millivolts.filter(|millivolts| *millivolts > 0)? as f64 / 1000.0;
+    let amps = milliamps.filter(|milliamps| *milliamps != 0)? as f64 / 1000.0;
+    Some((volts, amps, volts * amps))
+}
 
+pub fn battery() -> CategoryReading {
         unsafe {
             let blob = IOPSCopyPowerSourcesInfo();
             if blob.is_null() {
@@ -66,32 +81,25 @@ pub fn battery(smc: &[(String, f64)]) -> CategoryReading {
                 reading: format::percent(charge_percent),
             }];
 
-            // IOPS reports millivolts and milliamps, exactly like B0AV/B0AC,
-            // so both sources go through the same division. IOPS wins: B0AC
-            // sits at 0 on machines where only the power-source description
-            // knows the real draw.
-            let voltage = dict_int(description, "Voltage")
-                .map(|millivolts| millivolts as f64 / 1000.0)
-                .or_else(|| lookup("B0AV").map(|millivolts| millivolts / 1000.0));
-            let amperage = dict_int(description, "Current")
-                .map(|milliamps| milliamps as f64 / 1000.0)
-                .or_else(|| lookup("B0AC").map(|milliamps| milliamps / 1000.0).filter(|amps| *amps != 0.0));
-            if let (Some(volts), Some(amps)) = (voltage, amperage) {
+            // IOPS reports millivolts and milliamps.
+            if let Some((volts, amps, watts)) =
+                electrical(dict_int(description, "Voltage"), dict_int(description, "Current"))
+            {
                 sensors.push(Sensor {
                     id: "battery.power".into(),
-                    key: "B0AV×B0AC".into(),
+                    key: "power".into(),
                     label: "Power".into(),
-                    reading: format::watts(volts * amps),
+                    reading: format::watts(watts),
                 });
                 sensors.push(Sensor {
                     id: "battery.voltage".into(),
-                    key: "B0AV".into(),
+                    key: "voltage".into(),
                     label: "Voltage".into(),
                     reading: format::voltage(volts),
                 });
                 sensors.push(Sensor {
                     id: "battery.current".into(),
-                    key: "B0AC".into(),
+                    key: "current".into(),
                     label: "Current".into(),
                     reading: format::amperes(amps),
                 });

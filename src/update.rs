@@ -5,7 +5,7 @@
 //! makes a check safe to run from a menu: `--max-time` bounds it, and a dead
 //! network ends in an error string instead of a hung process.
 //!
-//! The release JSON is read by a scanner rather than a parser. Three fields are
+//! The release JSON is read by a scanner rather than a parser. Two fields are
 //! all the menu needs, and a scanner that only knows string tokens cannot be
 //! fooled by a release body that happens to quote a key name.
 
@@ -24,7 +24,6 @@ const INSTALLED: &str = "/Applications/Vitals.app";
 pub struct Update {
     pub version: String,
     pub dmg_url: String,
-    pub notes: String,
 }
 
 pub fn current_version() -> &'static str {
@@ -61,7 +60,6 @@ pub fn check() -> Result<Option<Update>, String> {
 /// Downloads the release image, mounts it and swaps the installed bundle for
 /// the one inside. Blocking, and long enough that the menu has to call it off
 /// the main thread.
-#[allow(dead_code)]
 pub fn install(update: &Update) -> Result<(), String> {
     let target = Path::new(INSTALLED);
     // Copying somewhere else would install a second app the user never opens,
@@ -286,13 +284,9 @@ fn curl(args: &[&str]) -> Result<Option<String>, String> {
 pub(crate) fn parse_release(json: &str) -> Option<Update> {
     let (tag, _) = field(json, "tag_name", 0)?;
     let version = tag.trim_start_matches('v').trim_start_matches('V').to_string();
-    let notes = field(json, "body", 0)
-        .map(|(body, _)| body.trim_end().to_string())
-        .unwrap_or_default();
     Some(Update {
         version,
         dmg_url: dmg_asset(json)?,
-        notes,
     })
 }
 

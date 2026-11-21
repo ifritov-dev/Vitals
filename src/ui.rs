@@ -33,6 +33,12 @@ const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900)
 /// How long the row keeps saying "up to date" after a check found nothing.
 const CURRENT_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long the row that collects a poll keeps looking for it. The first poll
+/// of a session opens the driver and enumerates its keys, which takes longer
+/// than one wait; a result nobody collects until the next refresh tick leaves
+/// the menu showing the numbers it had before the app restarted.
+const COLLECT_RETRIES: u8 = 20;
+
 struct AppState {
     store: SensorStore,
     prefs: Prefs,
@@ -58,6 +64,10 @@ struct AppState {
     tick_timer: Obj,
     /// One-shot timer that picks up the snapshot a tick asked for.
     collect_timer: Obj,
+    /// How many times that timer has looked again for a poll still running,
+    /// so a slow first poll is collected early and a wedged one is not chased
+    /// for ever.
+    collect_waits: u8,
     /// What the menu bar currently says, so an unchanged reading is not
     /// redrawn.
     last_title: String,
@@ -299,28 +309,6 @@ impl Updates {
         }
     }
 
-    /// Rewrites the visible Check for Updates row from the state machine, so a
-/// result shows up in the open menu instead of only on the next open. This is
-/// what made a fast check look like a slow one.
-fn refresh_update_row(state: &mut AppState) {
-    if state.update_item.is_null() {
-        return;
-    }
-    let (title, enabled) = state.updates.row();
-    unsafe {
-        objc::send_void_obj(state.update_item, "setTitle:", objc::nsstring(&title));
-        objc::send_void_int(state.update_item, "setEnabled:", if enabled { 1 } else { 0 });
-    }
-}
-
-/// Returns the row to "Check for Updates" once the menu closes: the result
-    /// of a check belongs to the moment it was made, not to the next open.
-    fn dismiss(&mut self) {
-        // "Up to date" outlives the menu on purpose: it is the answer to a
-        // question just asked. A failure is reported the same way, so both
-        // stay until something replaces them.
-    }
-
     /// Fails the work in flight when its worker has gone quiet, so the row can
     /// never sit on "Checking for Updates…" for good.
     fn timed_out(&mut self) -> bool {
@@ -441,6 +429,7 @@ pub fn run() {
             poller: Some(crate::poller::Poller::start()),
             tick_timer: std::ptr::null_mut(),
             collect_timer: std::ptr::null_mut(),
+            collect_waits: 0,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
@@ -611,8 +600,7 @@ unsafe extern "C" fn menu_did_close(_this: Obj, _cmd: Sel, menu: Obj) {
         }
         state.open_menu = std::ptr::null_mut();
         state.open_submenu = None;
-        state.updates.dismiss();
-        clear_tracked_items(state);
+        release_tracked(state, |_| true);
         state.live_ids.clear();
         state.row_values.clear();
     });
@@ -719,7 +707,7 @@ unsafe extern "C" fn reopen_menu(_this: Obj, _cmd: Sel, _timer: Obj) {
         return;
     }
     let Some(button) = button_of(item) else { return };
-    let height = unsafe { objc::send_size(button, "bounds").height };
+    let height = unsafe { objc::send_rect(button, "bounds").height };
     unsafe {
         objc::send_void_item_point_view(
             menu,
@@ -963,7 +951,8 @@ fn apply_status_length(state: &mut AppState, slots: &[(Category, String)]) {
             }
             let width = match state.status_slots.get(category) {
                 Some((text, width)) if text == value => *width,
-                _ => slot_width(Some(*category), value),
+                Some((_, width)) => slot_width(Some(*category), value).max(*width),
+                None => slot_width(Some(*category), value),
             };
             state.status_slots.insert(*category, (value.clone(), width));
             total += width;
@@ -992,17 +981,9 @@ fn update_status_titles(state: &mut AppState) {
                 return;
             }
             let Some(button) = button_of(*item) else { return };
-            let slots: Vec<(Category, String)> = categories
-                .iter()
-                .map(|category| {
-                    let reading = state.store.get(*category);
-                    let value = reading
-                        .reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
-                    (*category, status_slot_text(value))
-                })
-                .collect();
             // Sized from the readings about to be drawn, so the item is never
             // narrower than its content and never wider than it needs.
+            let slots = status_slots(state);
             apply_status_length(state, &slots);
             let mut title = Attributed::new();
             for (index, (category, value)) in slots.iter().enumerate() {
@@ -1038,14 +1019,22 @@ fn update_status_titles(state: &mut AppState) {
     }
 }
 
-/// Drops the app's own reference to every menu row it tracks. The menu holds
-/// one too, so a row lives until the menu is rebuilt or closed; tracking it
-/// with an unowned pointer is what made a rebuild after a few opens read a
-/// pointer that had already been freed.
-fn clear_tracked_items(state: &mut AppState) {
+/// Drops the app's own reference to the rows whose tags `should_drop` accepts.
+/// The menu holds a reference of its own, so this never destroys a row still
+/// on screen; it only gives back the one this app took when it built the row,
+/// which is what a rebuild has to do or every rebuild keeps a live row forever.
+fn release_tracked(state: &mut AppState, should_drop: impl Fn(isize) -> bool) {
+    let stale: Vec<isize> = state
+        .live_items
+        .keys()
+        .copied()
+        .filter(|tag| should_drop(*tag))
+        .collect();
     unsafe {
-        for item in state.live_items.drain().map(|(_, item)| item) {
-            objc::release(item);
+        for tag in stale {
+            if let Some(item) = state.live_items.remove(&tag) {
+                objc::release(item);
+            }
         }
     }
 }
@@ -1093,6 +1082,7 @@ unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
         }
         let fresh = match state.poller.as_ref().map(|poller| poller.take()) {
             Some(Polled::Snapshot(snapshot)) => {
+                state.collect_waits = 0;
                 state.store.apply(snapshot);
                 true
             }
@@ -1100,12 +1090,28 @@ unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
                 // The worker died: without this the menu keeps presenting its
                 // last reading as if it were live.
                 restart_poller(state);
+                look_again(state);
                 false
             }
-            Some(Polled::Empty) | None => false,
+            Some(Polled::Empty) | None => {
+                look_again(state);
+                false
+            }
         };
         show_latest(state, fresh);
     });
+}
+
+/// Arms one more short wait for a poll that has not finished. Without it the
+/// result of a slow poll — the first of a session opens the driver and
+/// enumerates every key — would sit in the channel until the next refresh
+/// tick, and the menu would show the numbers from before the restart.
+fn look_again(state: &mut AppState) {
+    if state.collect_waits >= COLLECT_RETRIES {
+        return;
+    }
+    state.collect_waits = state.collect_waits.saturating_add(1);
+    schedule_collect(state);
 }
 
 /// Replaces a poller whose thread is gone, a bounded number of times: a
@@ -1308,7 +1314,7 @@ fn populate(state: &mut AppState, menu: Obj) {
     let _pool = objc::AutoreleasePool::new();
     unsafe {
         objc::send_void(menu, "removeAllItems");
-        clear_tracked_items(state);
+        release_tracked(state, |_| true);
         state.live_ids.clear();
         state.row_values.clear();
         // The submenus are rebuilt with the dropdown, so the mapping from the
@@ -1433,9 +1439,7 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
     unsafe {
         objc::send_void(menu, "removeAllItems");
         let first_tag = category_tag(category, None) - 1;
-        state
-            .live_items
-            .retain(|tag, _| *tag < first_tag || *tag >= first_tag + 1000);
+        release_tracked(state, |tag| (first_tag..first_tag + 1000).contains(&tag));
         state
             .live_ids
             .retain(|tag, _| *tag < first_tag || *tag >= first_tag + 1000);
@@ -1566,6 +1570,15 @@ fn refresh_values(state: &mut AppState) {
             .collect();
         let needed = column_right_with(&labels, &values, ICON_SLOT);
         if needed > state.row_tab {
+            // Rows written in place keep the tab stops they were laid out
+            // with, so a column that has to grow shows its values ending
+            // short of the right edge until the menu is opened again. Building
+            // the menu afresh is exactly what that next open does.
+            let menu = state.open_menu;
+            if !menu.is_null() && state.open_submenu.is_none() {
+                populate(state, menu);
+                return;
+            }
             state.row_tab = needed;
         }
         let row_tab = state.row_tab;
@@ -1936,6 +1949,7 @@ pub fn dump_menu() -> String {
             poller: None,
             tick_timer: std::ptr::null_mut(),
             collect_timer: std::ptr::null_mut(),
+            collect_waits: 0,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
@@ -2136,6 +2150,7 @@ pub fn render_rows(path: &str) {
             poller: None,
             tick_timer: std::ptr::null_mut(),
             collect_timer: std::ptr::null_mut(),
+            collect_waits: 0,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
@@ -2266,6 +2281,7 @@ pub fn bench_menu() -> String {
             poller: None,
             tick_timer: std::ptr::null_mut(),
             collect_timer: std::ptr::null_mut(),
+            collect_waits: 0,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),

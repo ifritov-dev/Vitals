@@ -1,0 +1,31 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build and self-test
+    # arm64, like the release: the Objective-C interop assumes objc_msgSend's
+    # arm64 calling convention.
+    runs-on: macos-15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      # The self-test needs no bundle and no network: it asserts the decoders,
+      # the formatters, the battery maths and the release parser against known
+      # bytes, so a broken build never reaches a release.
+      - name: Self-test
+        run: ./target/release/vitals --selftest

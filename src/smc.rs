@@ -303,7 +303,6 @@ fn is_interesting(key: &str) -> bool {
     let b = key.as_bytes();
     match category_for_key(key) {
         Some(Category::Fan) => b[2] == b'A' && b[3] == b'c' && b[1].is_ascii_digit(),
-        Some(Category::Battery) => matches!(key, "B0AV" | "B0AC"),
         Some(_) => true,
         None => false,
     }

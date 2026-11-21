@@ -116,10 +116,37 @@ pub fn run() -> Outcome {
     );
     out.check("negative clamps to zero", format::scaled_bytes(-5.0) == "0 B");
 
+    // The battery's electrical rows, from the millivolt and milliamp figures
+    // the power source description reports. A charging Mac says 0 for current
+    // while pulling several amps, and that must not become a "0.0 W" reading.
+    let charging = crate::sensors::battery::electrical(Some(12_371), Some(4_090));
+    out.close("battery voltage", charging.map(|(volts, _, _)| volts), 12.371, 1e-9);
+    out.close("battery current", charging.map(|(_, amps, _)| amps), 4.09, 1e-9);
+    out.close(
+        "battery power",
+        charging.map(|(_, _, watts)| watts),
+        50.59739,
+        1e-4,
+    );
+    out.check(
+        "a zero current is no reading at all",
+        crate::sensors::battery::electrical(Some(12_371), Some(0)).is_none()
+            && crate::sensors::battery::electrical(None, Some(4_090)).is_none(),
+    );
+    out.check(
+        "a discharge reports a negative draw",
+        crate::sensors::battery::electrical(Some(12_000), Some(-1_500))
+            .map(|(_, _, watts)| watts)
+            == Some(-18.0),
+    );
+
     out.check(
         "key maps to its category",
         crate::model::category_for_key("TC0P") == Some(Category::Temperature)
-            && crate::model::category_for_key("B0AC") == Some(Category::Battery)
+            && crate::model::category_for_key("F0Ac") == Some(Category::Fan)
+            // The SMC's battery keys are not polled: the power source
+            // description is the only source that reports them correctly.
+            && crate::model::category_for_key("B0AC").is_none()
             && crate::model::category_for_key("NOPE").is_none(),
     );
     // An empty menu bar must still produce a non-empty title: the status item
@@ -213,18 +240,6 @@ pub fn run() -> Outcome {
         "release picks the dmg asset",
         parsed.as_ref().map(|u| u.dmg_url.as_str())
             == Some("https://example.test/Vitals-1.2.0.dmg"),
-    );
-    // The body is the only field where escapes and multi-line text arrive, and
-    // the menu renders it verbatim.
-    out.check(
-        "release notes keep their lines and quotes",
-        parsed
-            .as_ref()
-            .map(|u| {
-                u.notes.starts_with("Fan readings no longer go stale\n\n- the \"maximum\"")
-                    && u.notes.contains("\"tag_name\"")
-            })
-            .unwrap_or(false),
     );
     // A release body that quotes key names arrives before the real fields, and
     // reading it as structure would place the update on the wrong asset.

@@ -2,7 +2,7 @@
 
 A macOS menu bar monitor for the numbers a Mac will tell you if you ask: CPU,
 memory, temperatures, fan speeds, battery, network and disk. Native AppKit, no
-web view, no Electron, one dependency (`libc`) and about 4,500 lines of Rust.
+web view, no Electron, one dependency (`libc`) and about 6,000 lines of Rust.
 
 Every sensor is read from the same places `powermetrics`, `pmset` and
 Activity Monitor read them — the AppleSMC IOKit driver, `mach` host statistics,
@@ -58,7 +58,7 @@ have put there, and clicking it opens the dropdown.
 
 - **Rows** — each category shows its average and opens a submenu of every
   sensor it found: individual SMC keys for temperature, voltage and fans, per
-  core for the CPU, per volume for storage.
+  core for the CPU, the boot volume for storage.
 - **Choosing a sensor** — picking a sensor shows that sensor in the menu bar;
   picking the row that is already active removes the category from the bar.
 - **Refresh Interval** — 1 to 10 seconds, 5 by default. Only the categories on
@@ -145,8 +145,8 @@ $ /Applications/Vitals.app/Contents/MacOS/Vitals --dump --samples 1
 | Temperature, Voltage, Fan | AppleSMC via `IOConnectCallStructMethod`, decoded from the `sp78`/`fpe2`/`flt`/`si*` data types |
 | Memory, Processor, System | `host_statistics64`, `host_processor_info`, `sysctl` |
 | Network | `getifaddrs`, per-interface 32-bit counters diffed with wrap-around |
-| Storage | `statfs` per mounted volume |
-| Battery | IOPS power source description, with the SMC keys as a fallback |
+| Storage | `statfs` on the boot volume |
+| Battery | IOPS power source description |
 
 ## Layout
 
