@@ -1,15 +1,22 @@
 //! One snapshot of every category.
 
-use crate::model::{Category, CategoryReading, ALL_CATEGORIES};
+use std::collections::HashMap;
+
+use crate::model::{category_for_key, format, Category, CategoryReading, Reading, ALL_CATEGORIES};
 use crate::sensors::{self, SystemSensors};
 use crate::smc::SmcService;
+
+/// A failed or unhealthy driver connection is retried every this many polls,
+/// not on every one: opening costs a round trip and is usually fine.
+const RECONNECT_EVERY: u32 = 20;
+/// A sensor whose key stops answering shows "No data" after this many
+/// consecutive misses instead of its last good number forever.
+const MISSES_BEFORE_NO_DATA: u8 = 3;
 
 /// A finished poll, handed from the polling thread to the UI.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub readings: Vec<CategoryReading>,
-    pub total_keys: usize,
-    pub polled_keys: usize,
 }
 
 fn smc_category(category: Category) -> bool {
@@ -23,27 +30,29 @@ pub struct SensorStore {
     smc: Option<SmcService>,
     system: SystemSensors,
     snapshot: Vec<CategoryReading>,
+    misses: HashMap<String, u8>,
+    polls_since_open: u32,
     pub total_keys: usize,
     pub polled_keys: usize,
 }
 
 impl SensorStore {
     pub fn new() -> SensorStore {
-        let smc = SmcService::open();
-        let total_keys = smc.as_ref().map(|s| s.total_keys).unwrap_or(0);
-        let polled_keys = smc.as_ref().map(|s| s.specs.len()).unwrap_or(0);
         let mut system = SystemSensors::new();
         system.prime();
-        SensorStore {
-            smc,
+        let mut store = SensorStore {
+            smc: None,
             system,
-            snapshot: ALL_CATEGORIES
-                .iter()
-                .map(|c| CategoryReading::empty(*c))
-                .collect(),
-            total_keys,
-            polled_keys,
-        }
+            snapshot: ALL_CATEGORIES.map(|_| CategoryReading::empty()).to_vec(),
+            misses: HashMap::new(),
+            // The first refresh retries, so a driver hiccup at launch costs
+            // one poll rather than the SMC categories for the whole session.
+            polls_since_open: RECONNECT_EVERY,
+            total_keys: 0,
+            polled_keys: 0,
+        };
+        store.ensure_connection();
+        store
     }
 
     /// A store with no SMC connection, for the GUI: the readings arrive from
@@ -52,10 +61,9 @@ impl SensorStore {
         SensorStore {
             smc: None,
             system: SystemSensors::new(),
-            snapshot: ALL_CATEGORIES
-                .iter()
-                .map(|c| CategoryReading::empty(*c))
-                .collect(),
+            snapshot: ALL_CATEGORIES.map(|_| CategoryReading::empty()).to_vec(),
+            misses: HashMap::new(),
+            polls_since_open: 0,
             total_keys: 0,
             polled_keys: 0,
         }
@@ -69,15 +77,43 @@ impl SensorStore {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             readings: self.snapshot.clone(),
-            total_keys: self.total_keys,
-            polled_keys: self.polled_keys,
         }
     }
 
     pub fn apply(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot.readings;
-        self.total_keys = snapshot.total_keys;
-        self.polled_keys = snapshot.polled_keys;
+    }
+
+    /// Opens the driver when there is no connection, and drops one that has
+    /// stopped answering so the next attempt can replace it.
+    fn ensure_connection(&mut self) {
+        self.polls_since_open = self.polls_since_open.saturating_add(1);
+        if let Some(service) = self.smc.as_ref() {
+            if service.healthy() {
+                return;
+            }
+            self.smc = None;
+            self.polls_since_open = RECONNECT_EVERY;
+        }
+        if self.polls_since_open < RECONNECT_EVERY {
+            return;
+        }
+        self.polls_since_open = 0;
+        // A connection that enumerates no keys is a failed open: keeping it
+        // would leave every SMC category on "No data" for the session.
+        let Some(service) = SmcService::open().filter(|service| !service.specs.is_empty()) else {
+            return;
+        };
+        self.total_keys = service.total_keys;
+        self.polled_keys = service.specs.len();
+        self.smc = Some(service);
+    }
+
+    fn read(&self, keep: &dyn Fn(&crate::smc::Spec) -> bool) -> Vec<(String, f64)> {
+        self.smc
+            .as_ref()
+            .map(|service| service.read_values_where(keep))
+            .unwrap_or_default()
     }
 
     pub fn refresh(&mut self) {
@@ -88,6 +124,7 @@ impl SensorStore {
     /// that single key; only a category showing its average needs the whole
     /// family, because the average is over all of them.
     pub fn refresh_shown(&mut self, shown: &[(Category, Option<String>)]) {
+        self.ensure_connection();
         let exact: Vec<&str> = shown
             .iter()
             .filter(|(category, sensor)| sensor.is_some() && smc_category(*category))
@@ -99,38 +136,38 @@ impl SensorStore {
             .map(|(category, _)| *category)
             .collect();
 
-        let keep = |spec: &crate::smc::Spec| {
-            if exact.iter().any(|key| spec.key == *key) {
-                return true;
-            }
-            match spec.key.as_bytes().first() {
-                Some(b'T') => averages.contains(&Category::Temperature),
-                Some(b'V') => averages.contains(&Category::Voltage),
-                Some(b'F') => averages.contains(&Category::Fan),
-                Some(b'B') => averages.contains(&Category::Battery),
-                _ => false,
-            }
+        let keep = |spec: &crate::smc::Spec| match category_for_key(&spec.key) {
+            Some(_) if exact.iter().any(|key| spec.key == *key) => true,
+            Some(category) => averages.contains(&category),
+            None => false,
         };
-        let values = self
-            .smc
-            .as_ref()
-            .map(|service| service.read_values_where(&keep))
-            .unwrap_or_default();
+        let values = self.read(&keep);
 
         for (category, selection) in shown {
             let Some(id) = selection.as_deref().filter(|_| smc_category(*category)) else {
                 self.refresh_category(*category, &values);
                 continue;
             };
-            let Some(value) = values.iter().find(|(key, _)| key == id).map(|(_, v)| *v) else {
+            let slot = category.index();
+            let Some(sensor) = self.snapshot[slot].sensors.iter().position(|s| s.id == id) else {
+                // The sensor list was rebuilt without this id; rebuild the
+                // category rather than keep a reading nobody selected.
+                self.refresh_category(*category, &values);
                 continue;
             };
-            let mut reading = self.snapshot[category.index()].clone();
-            let Some(sensor) = reading.sensors.iter_mut().find(|sensor| sensor.id == id) else {
-                continue;
-            };
-            sensor.reading = crate::model::format::for_category(*category, value);
-            self.snapshot[category.index()] = reading;
+            match values.iter().find(|(key, _)| key == id).map(|(_, value)| *value) {
+                Some(value) => {
+                    self.misses.remove(id);
+                    self.snapshot[slot].sensors[sensor].reading = format::for_category(*category, value);
+                }
+                None => {
+                    let misses = self.misses.entry(id.to_string()).or_insert(0);
+                    *misses = misses.saturating_add(1);
+                    if *misses >= MISSES_BEFORE_NO_DATA {
+                        self.snapshot[slot].sensors[sensor].reading = Reading::no_data();
+                    }
+                }
+            }
         }
     }
 
@@ -153,22 +190,15 @@ impl SensorStore {
     /// the rest. The menu bar usually shows two or three categories, and SMC
     /// keys for the other six cost a driver call each.
     pub fn refresh_categories(&mut self, wanted: &[Category]) {
-        let wants = |category: Category| wanted.contains(&category);
-        let keep = |spec: &crate::smc::Spec| match spec.key.as_bytes().first() {
-            Some(b'T') => wants(Category::Temperature),
-            Some(b'V') => wants(Category::Voltage),
-            Some(b'F') => wants(Category::Fan),
-            Some(b'B') => wants(Category::Battery),
-            _ => false,
+        self.ensure_connection();
+        let keep = |spec: &crate::smc::Spec| match category_for_key(&spec.key) {
+            Some(category) => wanted.contains(&category),
+            None => false,
         };
-        let values = self
-            .smc
-            .as_ref()
-            .map(|service| service.read_values_where(&keep))
-            .unwrap_or_default();
+        let values = self.read(&keep);
 
         for category in ALL_CATEGORIES {
-            if wants(category) {
+            if wanted.contains(&category) {
                 self.refresh_category(category, &values);
             }
         }

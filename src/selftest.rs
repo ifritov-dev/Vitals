@@ -1,6 +1,7 @@
 //! Assertions for the pure logic, runnable from the app itself.
 
 use crate::model::{format, Category, CategoryReading, Reading};
+use crate::store::SensorStore;
 use crate::prefs::Prefs;
 use std::collections::HashMap;
 use crate::smc::decode;
@@ -95,12 +96,64 @@ pub fn run() -> Outcome {
 
     out.check("format 0 B", format::scaled_bytes(0.0) == "0 B");
     out.check("format 812 B", format::scaled_bytes(812.0) == "812 B");
-    out.check("format 1.5 KB", format::scaled_bytes(1536.0) == "1.50 KB");
+    out.check("format 1.5 KiB", format::scaled_bytes(1536.0) == "1.50 KiB");
     out.check(
-        "format 12.4 MB",
-        format::scaled_bytes(12.4 * 1024.0 * 1024.0) == "12.4 MB",
+        "format 12.4 MiB",
+        format::scaled_bytes(12.4 * 1024.0 * 1024.0) == "12.4 MiB",
     );
     out.check("compact percent", format::percent(57.859).compact == "58%");
+
+    // Unit boundaries are where a scaling bug hides: the rounded value must
+    // roll into the next unit rather than read as a full one below it.
+    out.check("1023 B stays bytes", format::scaled_bytes(1023.0) == "1023 B");
+    out.check(
+        "1023.9 KiB rolls into MiB",
+        format::scaled_bytes(1023.9 * 1024.0) == "1.00 MiB",
+    );
+    out.check(
+        "one byte short of MiB rolls up",
+        format::scaled_bytes(1024.0 * 1024.0 - 1.0) == "1.00 MiB",
+    );
+    out.check("negative clamps to zero", format::scaled_bytes(-5.0) == "0 B");
+
+    out.check(
+        "key maps to its category",
+        crate::model::category_for_key("TC0P") == Some(Category::Temperature)
+            && crate::model::category_for_key("B0AC") == Some(Category::Battery)
+            && crate::model::category_for_key("NOPE").is_none(),
+    );
+    // An empty menu bar must still produce a non-empty title: the status item
+    // collapses to zero width otherwise and the menu cannot be opened again.
+    let empty_bar = Prefs {
+        menu_bar: Vec::new(),
+        ..Prefs::default()
+    };
+    out.check(
+        "empty menu bar still has a title",
+        crate::ui::status_title(&empty_bar, &SensorStore::for_ui()) == "Vitals",
+    );
+    let two_slots = Prefs {
+        menu_bar: vec![Category::Memory, Category::Processor],
+        ..Prefs::default()
+    };
+    out.check(
+        "filled menu bar lists its slots",
+        crate::ui::status_title(&two_slots, &SensorStore::for_ui()).starts_with("memory="),
+    );
+
+    out.check(
+        "describe shows no data for an empty category",
+        CategoryReading::empty().describe(None) == "No data",
+    );
+    out.check(
+        "describe shows the average text",
+        CategoryReading {
+            sensors: Vec::new(),
+            average: format::percent(42.0),
+        }
+        .describe(None)
+            == "42.0%",
+    );
 
     // Choosing the row that is already active hides its category; choosing
     // anything else shows it and selects that row.
@@ -108,6 +161,7 @@ pub fn run() -> Outcome {
         menu_bar: vec![Category::Memory],
         selections: HashMap::new(),
         interval: 5.0,
+        start_at_login: false,
     };
     let shown = base.toggled(Category::Processor, Some("PROC_0"));
     out.check(
@@ -139,10 +193,14 @@ pub fn run() -> Outcome {
     out.check("no data marker", !Reading::no_data().has_data());
     out.check(
         "empty category says no data",
-        CategoryReading::empty(Category::Fan).reading_for(None).text == "No data",
+        CategoryReading::empty().reading_for(None).text == "No data",
     );
 
-    let prefs = Prefs::load();
+    // The preference checks read the stored domain, which only exists for the
+    // bundled app; the invariants they assert hold for any pref struct, so a
+    // default is enough to keep them meaningful headless.
+    let stored = Prefs::load();
+    let prefs = if stored.menu_bar.is_empty() { Prefs::default() } else { stored };
     out.check("interval inside range", prefs.interval >= 1.0 && prefs.interval <= 10.0);
     out.check(
         "menu bar slots are known categories",

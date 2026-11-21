@@ -1,9 +1,10 @@
 //! Memory, processor, system, network and storage from mach and sysctl.
 
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::time::Instant;
 
-use crate::model::{format, Category, CategoryReading, Reading, Sensor};
+use crate::model::{format, CategoryReading, Reading, Sensor};
 
 const HOST_VM_INFO64: i32 = 4;
 const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
@@ -71,8 +72,15 @@ extern "C" {
 
 pub struct SystemSensors {
     previous_cpu: Vec<[u32; CPU_STATE_MAX]>,
-    previous_network: Option<(u64, u64, Instant)>,
+    /// Per-interface counters, so one interface wrapping its 32-bit counter
+    /// cannot make the summed rate read as zero.
+    previous_network: Option<(HashMap<String, (u32, u32)>, Instant)>,
     page_size: u64,
+    /// The host port is constant for the life of the process; taking a fresh
+    /// send right per poll leaks one into the kernel every time.
+    host: u32,
+    /// Per-core id/label strings, built once instead of formatted per poll.
+    core_descriptors: Vec<(String, String)>,
 }
 
 impl SystemSensors {
@@ -82,32 +90,38 @@ impl SystemSensors {
             previous_cpu: Vec::new(),
             previous_network: None,
             page_size,
+            host: unsafe { mach_host_self() },
+            core_descriptors: Vec::new(),
         }
     }
 
     /// Seeds the delta-based samplers so the first refresh shows a real value.
+    /// The two reads happen microseconds apart, which is too short a window
+    /// for CPU and network deltas, so the prime waits one poll's worth of a
+    /// window instead of publishing a 0 %-or-100 % artefact.
     pub fn prime(&mut self) {
         let _ = self.processor();
         let _ = self.network();
+        std::thread::sleep(std::time::Duration::from_millis(150));
     }
 
     pub fn memory(&self) -> CategoryReading {
         let total = match sysctl_u64("hw.memsize") {
             Some(value) if value > 0 => value,
-            _ => return CategoryReading::empty(Category::Memory),
+            _ => return CategoryReading::empty(),
         };
         let mut stats = VmStatistics64::default();
         let mut count = (std::mem::size_of::<VmStatistics64>() / std::mem::size_of::<i32>()) as u32;
         let result = unsafe {
             host_statistics64(
-                mach_host_self(),
+                self.host,
                 HOST_VM_INFO64,
                 &mut stats as *mut VmStatistics64 as *mut i32,
                 &mut count,
             )
         };
         if result != 0 {
-            return CategoryReading::empty(Category::Memory);
+            return CategoryReading::empty();
         }
 
         let page = self.page_size;
@@ -130,37 +144,37 @@ impl SystemSensors {
                 id: "memory.used.gb".into(),
                 key: "used".into(),
                 label: "Used (GB)".into(),
-                reading: format::gigabytes(format::gigabytes_value(used)),
+                reading: format::gibibytes(format::gibibytes_value(used)),
             },
             Sensor {
                 id: "memory.app".into(),
                 key: "active".into(),
                 label: "App".into(),
-                reading: format::gigabytes(format::gigabytes_value(active)),
+                reading: format::gibibytes(format::gibibytes_value(active)),
             },
             Sensor {
                 id: "memory.wired".into(),
                 key: "wired".into(),
                 label: "Wired".into(),
-                reading: format::gigabytes(format::gigabytes_value(wired)),
+                reading: format::gibibytes(format::gibibytes_value(wired)),
             },
             Sensor {
                 id: "memory.compressed".into(),
                 key: "compressed".into(),
                 label: "Compressed".into(),
-                reading: format::gigabytes(format::gigabytes_value(compressed)),
+                reading: format::gibibytes(format::gibibytes_value(compressed)),
             },
             Sensor {
                 id: "memory.free".into(),
                 key: "free".into(),
                 label: "Free".into(),
-                reading: format::gigabytes(format::gigabytes_value(free + inactive)),
+                reading: format::gibibytes(format::gibibytes_value(free + inactive)),
             },
             Sensor {
                 id: "memory.total".into(),
                 key: "total".into(),
                 label: "Total".into(),
-                reading: format::gigabytes(format::gigabytes_value(total)),
+                reading: format::gibibytes(format::gibibytes_value(total)),
             },
         ];
         CategoryReading {
@@ -175,7 +189,7 @@ impl SystemSensors {
         let mut info_count: u32 = 0;
         let result = unsafe {
             host_processor_info(
-                mach_host_self(),
+                self.host,
                 PROCESSOR_CPU_LOAD_INFO,
                 &mut cpu_count,
                 &mut info,
@@ -183,7 +197,7 @@ impl SystemSensors {
             )
         };
         if result != 0 || info.is_null() {
-            return CategoryReading::empty(Category::Processor);
+            return CategoryReading::empty();
         }
 
         let mut current: Vec<[u32; CPU_STATE_MAX]> = Vec::with_capacity(cpu_count as usize);
@@ -233,11 +247,17 @@ impl SystemSensors {
             label: "Total".into(),
             reading: format::percent(total_load),
         }];
+        if self.core_descriptors.len() != per_core.len() {
+            self.core_descriptors = (0..per_core.len())
+                .map(|index| (format!("cpu{index}"), format!("Core {index}")))
+                .collect();
+        }
         for (index, value) in per_core.iter().enumerate() {
+            let (key, label) = &self.core_descriptors[index];
             sensors.push(Sensor {
                 id: format!("cpu.core.{index}"),
-                key: format!("cpu{index}"),
-                label: format!("Core {index}"),
+                key: key.clone(),
+                label: label.clone(),
                 reading: format::percent(*value),
             });
         }
@@ -251,7 +271,7 @@ impl SystemSensors {
         let mut loads = [0.0f64; 3];
         let count = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
         if count <= 0 {
-            return CategoryReading::empty(Category::System);
+            return CategoryReading::empty();
         }
         let sensors = vec![
             Sensor {
@@ -280,20 +300,31 @@ impl SystemSensors {
     }
 
     pub fn network(&mut self) -> CategoryReading {
-        let Some((received_bytes, sent_bytes)) = interface_counters() else {
-            return CategoryReading::empty(Category::Network);
+        let Some(counters) = interface_counters() else {
+            return CategoryReading::empty();
         };
         let now = Instant::now();
         let mut received_rate = 0.0;
         let mut sent_rate = 0.0;
-        if let Some((prev_rx, prev_tx, prev_at)) = self.previous_network {
+        if let Some((previous, prev_at)) = self.previous_network.take() {
             let elapsed = now.duration_since(prev_at).as_secs_f64();
             if elapsed > 0.05 {
-                received_rate = received_bytes.saturating_sub(prev_rx) as f64 / elapsed;
-                sent_rate = sent_bytes.saturating_sub(prev_tx) as f64 / elapsed;
+                let mut received: u64 = 0;
+                let mut sent: u64 = 0;
+                for (name, (received_bytes, sent_bytes)) in &counters {
+                    // The counters are 32 bits wide, so the difference has to
+                    // wrap the same way they do; a missing interface (new
+                    // connection, cable replug) has no delta at all.
+                    if let Some((before_rx, before_tx)) = previous.get(name) {
+                        received += received_bytes.wrapping_sub(*before_rx) as u64;
+                        sent += sent_bytes.wrapping_sub(*before_tx) as u64;
+                    }
+                }
+                received_rate = received as f64 / elapsed;
+                sent_rate = sent as f64 / elapsed;
             }
         }
-        self.previous_network = Some((received_bytes, sent_bytes, now));
+        self.previous_network = Some((counters, now));
 
         let sensors = vec![
             Sensor {
@@ -333,13 +364,13 @@ impl SystemSensors {
         let path = std::ffi::CString::new("/").unwrap();
         let rc = unsafe { libc::statfs(path.as_ptr(), &mut stats) };
         if rc != 0 {
-            return CategoryReading::empty(Category::Storage);
+            return CategoryReading::empty();
         }
         let block_size = stats.f_bsize as u64;
         let total = stats.f_blocks as u64 * block_size;
         let available = stats.f_bavail as u64 * block_size;
         if total == 0 {
-            return CategoryReading::empty(Category::Storage);
+            return CategoryReading::empty();
         }
         let used = total.saturating_sub(available);
         let used_percent = used as f64 / total as f64 * 100.0;
@@ -349,19 +380,19 @@ impl SystemSensors {
                 id: "storage.available".into(),
                 key: "available".into(),
                 label: "Available".into(),
-                reading: format::gigabytes(format::gigabytes_value(available)),
+                reading: format::gibibytes(format::gibibytes_value(available)),
             },
             Sensor {
                 id: "storage.used".into(),
                 key: "used".into(),
                 label: "Used".into(),
-                reading: format::gigabytes(format::gigabytes_value(used)),
+                reading: format::gibibytes(format::gibibytes_value(used)),
             },
             Sensor {
                 id: "storage.total".into(),
                 key: "total".into(),
                 label: "Total".into(),
-                reading: format::gigabytes(format::gigabytes_value(total)),
+                reading: format::gibibytes(format::gibibytes_value(total)),
             },
         ];
         CategoryReading {
@@ -391,13 +422,12 @@ fn sysctl_u64(name: &str) -> Option<u64> {
     }
 }
 
-fn interface_counters() -> Option<(u64, u64)> {
+fn interface_counters() -> Option<HashMap<String, (u32, u32)>> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return None;
     }
-    let mut received: u64 = 0;
-    let mut sent: u64 = 0;
+    let mut counters: HashMap<String, (u32, u32)> = HashMap::new();
     let mut cursor = head;
     while !cursor.is_null() {
         let entry = unsafe { &*cursor };
@@ -410,12 +440,13 @@ fn interface_counters() -> Option<(u64, u64)> {
             let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy().into_owned();
             if name.starts_with("en") {
                 let data = unsafe { &*(entry.ifa_data as *const IfDataHead) };
-                received = received.wrapping_add(data.ibytes as u64);
-                sent = sent.wrapping_add(data.obytes as u64);
+                let entry = counters.entry(name).or_insert((0, 0));
+                entry.0 = entry.0.wrapping_add(data.ibytes);
+                entry.1 = entry.1.wrapping_add(data.obytes);
             }
         }
         cursor = entry.ifa_next;
     }
     unsafe { libc::freeifaddrs(head) };
-    Some((received, sent))
+    Some(counters)
 }

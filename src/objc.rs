@@ -31,37 +31,53 @@ extern "C" {
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
     pub static NSRunLoopCommonModes: Obj;
-    pub static NSEventTrackingRunLoopMode: Obj;
 }
 
 #[link(name = "AppKit", kind = "framework")]
-extern "C" {}
-
-const NS_ASCII_STRING_ENCODING: usize = 1;
+extern "C" {
+    /// AppKit, not Foundation: the menu tracking run-loop mode is declared in
+    /// NSEvent.h, so this block is what puts AppKit on the link line.
+    pub static NSEventTrackingRunLoopMode: Obj;
+}
 
 fn cstring(value: &str) -> CString {
-    CString::new(value).unwrap_or_else(|_| CString::new("").unwrap())
+    // An interior NUL cannot be a class, selector or C string, so it is a bug
+    // in the caller rather than something to paper over with an empty name.
+    CString::new(value).expect("Objective-C name with an interior NUL")
+}
+
+thread_local! {
+    // Hot paths ask for the same handful of classes and selectors per row;
+    // resolving them once keeps a CString allocation out of every call.
+    static CLASSES: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static SELECTORS: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 pub unsafe fn class(name: &str) -> Obj {
-    // Hot paths ask for the same handful of classes per row; resolving them
-    // once keeps a CString allocation out of every call.
-    thread_local! {
-        static CLASSES: std::cell::RefCell<std::collections::HashMap<String, usize>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
     if let Some(pointer) = CLASSES.with(|cache| cache.borrow().get(name).copied()) {
         return pointer as Obj;
     }
     let resolved = objc_getClass(cstring(name).as_ptr());
-    CLASSES.with(|cache| {
-        cache.borrow_mut().insert(name.to_string(), resolved as usize);
-    });
+    // A miss is not cached, so a typo keeps failing instead of sticking.
+    if !resolved.is_null() {
+        CLASSES.with(|cache| {
+            cache.borrow_mut().insert(name.to_string(), resolved as usize);
+        });
+    }
     resolved
 }
 
 pub unsafe fn selector(name: &str) -> Sel {
-    sel_registerName(cstring(name).as_ptr())
+    if let Some(pointer) = SELECTORS.with(|cache| cache.borrow().get(name).copied()) {
+        return pointer as Sel;
+    }
+    let resolved = sel_registerName(cstring(name).as_ptr());
+    SELECTORS.with(|cache| {
+        cache.borrow_mut().insert(name.to_string(), resolved as usize);
+    });
+    resolved
 }
 
 /// Sends a message that takes no arguments and returns an object.
@@ -121,9 +137,11 @@ pub unsafe fn send_float_result(obj: Obj, sel: &str) -> f64 {
     function(obj, selector(sel))
 }
 
+/// `BOOL` is a signed char, so it is read as one and normalised rather than
+/// handed to Rust as a `bool`.
 pub unsafe fn send_bool_result(obj: Obj, sel: &str) -> bool {
-    let function: unsafe extern "C" fn(Obj, Sel) -> bool = transmute(objc_msgSend as *const ());
-    function(obj, selector(sel))
+    let function: unsafe extern "C" fn(Obj, Sel) -> i8 = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel)) != 0
 }
 
 /// Allocates an instance of `name`.
@@ -132,22 +150,12 @@ pub unsafe fn alloc(name: &str) -> Obj {
 }
 
 pub unsafe fn nsstring(value: &str) -> Obj {
-    let class = class("NSString");
     let c = cstring(value);
-    let function: unsafe extern "C" fn(Obj, Sel, *const c_char, usize) -> Obj =
+    let function: unsafe extern "C" fn(Obj, Sel, *const c_char) -> Obj =
         transmute(objc_msgSend as *const ());
-    function(
-        class,
-        selector("stringWithUTF8String:"),
-        c.as_ptr(),
-        NS_ASCII_STRING_ENCODING,
-    )
+    function(class("NSString"), selector("stringWithUTF8String:"), c.as_ptr())
 }
 
-
-pub fn msg_send_ptr() -> *const () {
-    objc_msgSend as *const ()
-}
 
 pub unsafe fn send_void_obj_obj(obj: Obj, sel: &str, a: Obj, b: Obj) {
     let function: unsafe extern "C" fn(Obj, Sel, Obj, Obj) = transmute(objc_msgSend as *const ());
@@ -160,7 +168,7 @@ pub unsafe fn send_float_obj_result(obj: Obj, sel: &str, arg: Obj) -> f64 {
 }
 
 
-/// `-addAttribute:value:range:` (range is an NSRange, two uintptr-sized words).
+/// A message with two object arguments, e.g. `-pathForResource:ofType:`.
 pub unsafe fn send_obj_obj(obj: Obj, sel: &str, a: Obj, b: Obj) -> Obj {
     let function: unsafe extern "C" fn(Obj, Sel, Obj, Obj) -> Obj = transmute(objc_msgSend as *const ());
     function(obj, selector(sel), a, b)
@@ -182,8 +190,9 @@ pub unsafe fn send_size_obj(obj: Obj, sel: &str, a: Obj) -> NSSize {
     function(obj, selector(sel), a)
 }
 
-/// `-[NSTextTab initWithTextAlignment:location:options:]`. NSTextAlignmentRight
-/// is 1 — 2 is centre, which staggers the column instead of aligning it.
+/// `-[NSTextTab initWithTextAlignment:location:options:]`. The alignment is 0
+/// (left) on purpose: each row puts its own stop where the value has to start,
+/// and a right-aligned stop ignores that offset and staggers the column.
 /// Returns a +1 tab; the caller releases it once a tab-stop array holds it.
 pub unsafe fn send_tab(location: f64) -> Obj {
     let options = send(class("NSDictionary"), "dictionary");
@@ -216,7 +225,7 @@ pub unsafe fn send_timer(
     user_info: Obj,
     repeats: bool,
 ) -> Obj {
-    let function: TimerFactory = transmute(msg_send_ptr());
+    let function: TimerFactory = transmute(objc_msgSend as *const ());
     function(obj, selector(sel), interval, target, action, user_info, repeats)
 }
 
@@ -236,9 +245,16 @@ pub unsafe fn release(obj: Obj) {
     function(obj, selector("release"));
 }
 
+/// A one-object message with a `BOOL` result, e.g. `-isKindOfClass:`.
+pub unsafe fn send_bool_obj(obj: Obj, sel: &str, a: Obj) -> bool {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj) -> i8 = transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a) != 0
+}
+
 pub unsafe fn send_bool_obj_result(obj: Obj, sel: &str, a: Obj, b: bool) -> bool {
-    let function: unsafe extern "C" fn(Obj, Sel, Obj, bool) -> bool = transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), a, b)
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, bool) -> i8 =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), a, b) != 0
 }
 
 pub unsafe fn send_obj_int_obj(obj: Obj, sel: &str, a: isize, b: Obj) -> Obj {
@@ -251,10 +267,10 @@ pub unsafe fn send_obj_int_obj(obj: Obj, sel: &str, a: isize, b: Obj) -> Obj {
 
 
 
-pub unsafe fn send_obj_size_int(obj: Obj, sel: &str, width: f64, height: f64, flag: isize) -> Obj {
-    let function: unsafe extern "C" fn(Obj, Sel, f64, f64, isize) -> Obj =
+pub unsafe fn send_obj_size(obj: Obj, sel: &str, width: f64, height: f64) -> Obj {
+    let function: unsafe extern "C" fn(Obj, Sel, f64, f64) -> Obj =
         transmute(objc_msgSend as *const ());
-    function(obj, selector(sel), width, height, flag)
+    function(obj, selector(sel), width, height)
 }
 
 pub unsafe fn send_void_range_point(obj: Obj, sel: &str, location: usize, length: usize, x: f64, y: f64) {
@@ -263,8 +279,10 @@ pub unsafe fn send_void_range_point(obj: Obj, sel: &str, location: usize, length
     function(obj, selector(sel), location, length, x, y);
 }
 
-pub unsafe fn send_point_int(obj: Obj, sel: &str, index: usize) -> (f64, f64) {
-    let function: unsafe extern "C" fn(Obj, Sel, usize) -> (f64, f64) =
+/// `NSPoint` and `NSSize` are the same two doubles, so the geometry helpers
+/// share one return type.
+pub unsafe fn send_point_int(obj: Obj, sel: &str, index: usize) -> NSSize {
+    let function: unsafe extern "C" fn(Obj, Sel, usize) -> NSSize =
         transmute(objc_msgSend as *const ());
     function(obj, selector(sel), index)
 }

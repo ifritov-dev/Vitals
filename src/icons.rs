@@ -70,6 +70,14 @@ pub fn font(size: f64) -> Option<Obj> {
         }
         found
     };
+    // `+fontWithName:size:` hands back an autoreleased font, and this cache
+    // outlives the pool that created it: without the extra reference the next
+    // row build after a pool drain would message a freed NSFont.
+    let resolved = if resolved.is_null() {
+        resolved
+    } else {
+        unsafe { objc::retain(resolved) }
+    };
     FONTS.with(|cache| {
         cache.borrow_mut().insert(key, resolved as usize);
     });

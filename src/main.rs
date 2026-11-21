@@ -26,9 +26,21 @@ fn emit(text: &str, path: Option<String>) {
     match path {
         Some(path) => match std::fs::write(&path, text) {
             Ok(()) => println!("wrote {path}"),
-            Err(error) => eprintln!("could not write {path}: {error}"),
+            Err(error) => {
+                eprintln!("could not write {path}: {error}");
+                std::process::exit(1);
+            }
         },
         None => print!("{text}"),
+    }
+}
+
+/// Outside the app bundle `+standardUserDefaults` is a different domain, so a
+/// diagnostic that silently read it would report defaults as the user's
+/// settings. Say so instead.
+fn warn_outside_bundle(command: &str) {
+    if !login::bundled() {
+        eprintln!("{command}: run the installed app to read its preferences");
     }
 }
 
@@ -66,6 +78,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--dump-menu") {
+        warn_outside_bundle("--dump-menu");
         ui::prepare_application();
         let text = ui::dump_menu();
         emit(&text, arg_value(&args, "--out"));
@@ -73,10 +86,7 @@ fn main() {
     }
 
     let headless = args.iter().any(|a| {
-        a == "--selftest"
-            || a == "--dump"
-            || a == "--dump-menu"
-            || a == "--print-config"
+        a == "--print-config"
             || a == "--bench-menu"
             || a == "--login-status"
             || a.starts_with("--set-")
@@ -87,52 +97,108 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--login-status") {
-        print!("start at login: {}\n", login::enabled());
+        ui::prepare_application();
+        let pref = if login::bundled() {
+            Prefs::load().start_at_login.to_string()
+        } else {
+            "unknown outside the app bundle".to_string()
+        };
+        print!(
+            "start at login: {pref}\nagent plist:    {}\nlaunchd job:    {}\n",
+            if login::installed() { "present" } else { "missing" },
+            if login::loaded() { "loaded" } else { "not loaded" },
+        );
         return;
     }
 
-    if let Some(value) = arg_value(&args, "--set-login") {
-        match login::set(value == "on") {
-            Ok(()) => println!("start at login: {}", login::enabled()),
-            Err(error) => println!("failed: {error}"),
+    if args.iter().any(|a| a == "--set-login") {
+        let Some(value) = arg_value(&args, "--set-login") else {
+            eprintln!("--set-login takes on or off");
+            std::process::exit(2);
+        };
+        let enabled = match value.as_str() {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            other => {
+                eprintln!("--set-login takes on or off, not {other}");
+                std::process::exit(2);
+            }
+        };
+        ui::prepare_application();
+        // The flag lives in the app's own preference domain: wiring the agent
+        // from a process outside it would be undone by the next launch.
+        if !login::bundled() {
+            eprintln!("--set-login must run from the installed app bundle");
+            std::process::exit(1);
+        }
+        match login::apply(enabled) {
+            Ok(()) => {
+                Prefs::load().set_start_at_login(enabled);
+                println!("start at login: {enabled}");
+            }
+            Err(error) => {
+                eprintln!("failed: {error}");
+                std::process::exit(1);
+            }
         }
         return;
     }
 
     if args.iter().any(|a| a == "--bench-menu") {
+        warn_outside_bundle("--bench-menu");
         ui::prepare_application();
         print!("{}", ui::bench_menu());
         return;
     }
 
     if let Some(path) = arg_value(&args, "--render-rows") {
+        warn_outside_bundle("--render-rows");
         ui::prepare_application();
         ui::render_rows(&path);
         return;
     }
 
     if args.iter().any(|a| a == "--print-config") {
+        warn_outside_bundle("--print-config");
         ui::prepare_application();
         let prefs = Prefs::load();
         print!("{}", diag::config_dump(&prefs));
         return;
     }
 
-    if let Some(category_key) = arg_value(&args, "--set-selection") {
-        ui::prepare_application();
-        if let Some(category) = Category::from_key(&category_key) {
-            let mut prefs = Prefs::load();
-            let sensor = arg_value(&args, "--sensor");
-            let sensor = sensor.as_deref().filter(|s| *s != "average");
-            prefs.set_selection(category, sensor);
-            println!(
-                "saved {} -> {}",
-                category.key(),
-                sensor.unwrap_or("average")
-            );
+    if args.iter().any(|a| a == "--set-selection") {
+        let Some(category_key) = arg_value(&args, "--set-selection") else {
+            eprintln!("--set-selection takes a category");
+            std::process::exit(2);
+        };
+        let Some(category) = Category::from_key(&category_key) else {
+            eprintln!("unknown category {category_key}");
+            std::process::exit(2);
+        };
+        // A write into the wrong domain would report success and change
+        // nothing the menu reads.
+        if !login::bundled() {
+            eprintln!("--set-selection must run from the installed app bundle");
+            std::process::exit(1);
         }
+        ui::prepare_application();
+        let mut prefs = Prefs::load();
+        let sensor = arg_value(&args, "--sensor");
+        let sensor = sensor.as_deref().filter(|s| *s != "average");
+        prefs.set_selection(category, sensor);
+        println!(
+            "saved {} -> {}",
+            category.key(),
+            sensor.unwrap_or("average")
+        );
         return;
     }
 
+    // macOS deletes the login agent file on its own, so the agent is rebuilt
+    // from the preference on every launch instead of read back from disk.
+    ui::prepare_application();
+    if let Err(error) = login::apply(Prefs::load().start_at_login) {
+        eprintln!("start at login: {error}");
+    }
     ui::run();
 }

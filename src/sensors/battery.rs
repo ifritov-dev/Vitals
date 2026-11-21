@@ -2,7 +2,7 @@
 
 use std::ffi::{c_char, c_void, CStr};
 
-use crate::model::{format, Category, CategoryReading, Reading, Sensor};
+use crate::model::{format, CategoryReading, Reading, Sensor};
 
 extern "C" {
     fn IOPSCopyPowerSourcesInfo() -> *mut c_void;
@@ -19,29 +19,37 @@ pub fn battery(smc: &[(String, f64)]) -> CategoryReading {
         unsafe {
             let blob = IOPSCopyPowerSourcesInfo();
             if blob.is_null() {
-                return CategoryReading::empty(Category::Battery);
+                return CategoryReading::empty();
             }
             let list = IOPSCopyPowerSourcesList(blob);
             if list.is_null() {
                 CFRelease(blob);
-                return CategoryReading::empty(Category::Battery);
+                return CategoryReading::empty();
             }
             let count = CFArrayGetCount(list);
             if count == 0 {
                 CFRelease(list);
                 CFRelease(blob);
-                return CategoryReading::empty(Category::Battery);
+                return CategoryReading::empty();
             }
             let source = CFArrayGetValueAtIndex(list, 0);
             let description = IOPSGetPowerSourceDescription(blob, source);
             if description.is_null() {
                 CFRelease(list);
                 CFRelease(blob);
-                return CategoryReading::empty(Category::Battery);
+                return CategoryReading::empty();
             }
 
-            let current_capacity = dict_int(description, "Current Capacity").unwrap_or(0);
-            let max_capacity = dict_int(description, "Max Capacity").unwrap_or(100);
+            // Both capacities are needed for a percentage; inventing a 0 for a
+            // missing one would show a plausible charge level that is not real.
+            let (Some(current_capacity), Some(max_capacity)) = (
+                dict_int(description, "Current Capacity"),
+                dict_int(description, "Max Capacity"),
+            ) else {
+                CFRelease(list);
+                CFRelease(blob);
+                return CategoryReading::empty();
+            };
             let charging = dict_bool(description, "Is Charging").unwrap_or(false);
             let state = dict_string(description, "Power Source State").unwrap_or_default();
             let on_ac = state == "AC Power";
@@ -58,10 +66,16 @@ pub fn battery(smc: &[(String, f64)]) -> CategoryReading {
                 reading: format::percent(charge_percent),
             }];
 
-            let voltage = lookup("B0AV").map(|mv| mv / 1000.0);
-            let amperage = lookup("B0AC")
-                .map(|ma| ma / 1000.0)
-                .or_else(|| dict_int(description, "Current").map(|amps| amps as f64));
+            // IOPS reports millivolts and milliamps, exactly like B0AV/B0AC,
+            // so both sources go through the same division. IOPS wins: B0AC
+            // sits at 0 on machines where only the power-source description
+            // knows the real draw.
+            let voltage = dict_int(description, "Voltage")
+                .map(|millivolts| millivolts as f64 / 1000.0)
+                .or_else(|| lookup("B0AV").map(|millivolts| millivolts / 1000.0));
+            let amperage = dict_int(description, "Current")
+                .map(|milliamps| milliamps as f64 / 1000.0)
+                .or_else(|| lookup("B0AC").map(|milliamps| milliamps / 1000.0).filter(|amps| *amps != 0.0));
             if let (Some(volts), Some(amps)) = (voltage, amperage) {
                 sensors.push(Sensor {
                     id: "battery.power".into(),

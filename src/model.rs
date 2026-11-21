@@ -27,7 +27,7 @@ pub const ALL_CATEGORIES: [Category; 9] = [
 
 impl Category {
     pub fn index(self) -> usize {
-        ALL_CATEGORIES.iter().position(|c| *c == self).unwrap_or(0)
+        self as usize
     }
 
     pub fn key(self) -> &'static str {
@@ -48,6 +48,8 @@ impl Category {
         ALL_CATEGORIES.iter().copied().find(|c| c.key() == key)
     }
 
+    pub const COUNT: usize = ALL_CATEGORIES.len();
+
     pub fn title(self) -> &'static str {
         match self {
             Category::Temperature => "Temperature",
@@ -62,6 +64,27 @@ impl Category {
         }
     }
 
+}
+
+const _: () = {
+    let mut index = 0;
+    while index < ALL_CATEGORIES.len() {
+        assert!(ALL_CATEGORIES[index] as usize == index);
+        index += 1;
+    }
+};
+
+/// The category an SMC key belongs to, by its first byte. This is the one
+/// place the mapping lives: enumeration, the store's key filters and the
+/// sensor builders all ask here.
+pub fn category_for_key(key: &str) -> Option<Category> {
+    match key.as_bytes().first()? {
+        b'T' => Some(Category::Temperature),
+        b'V' => Some(Category::Voltage),
+        b'F' => Some(Category::Fan),
+        b'B' => Some(Category::Battery),
+        _ => None,
+    }
 }
 
 /// One number ready for display: full text for a menu row and the terse text
@@ -106,10 +129,21 @@ pub struct CategoryReading {
 }
 
 impl CategoryReading {
-    pub fn empty(_category: Category) -> CategoryReading {
+    pub fn empty() -> CategoryReading {
         CategoryReading {
             sensors: Vec::new(),
             average: Reading::no_data(),
+        }
+    }
+
+    /// The text a row shows for this category: the chosen sensor's, or the
+    /// average, or "No data". Shared so the dump and the menu cannot drift.
+    pub fn describe(&self, selection: Option<&str>) -> String {
+        let reading = self.reading_for(selection);
+        if reading.has_data() {
+            reading.text.clone()
+        } else {
+            "No data".to_string()
         }
     }
 
@@ -162,8 +196,8 @@ pub mod format {
         Reading::new(value, format!("{value:.1}%"), format!("{value:.0}%"))
     }
 
-    pub fn gigabytes(value: f64) -> Reading {
-        Reading::new(value, format!("{value:.1} GB"), format!("{value:.1}G"))
+    pub fn gibibytes(value: f64) -> Reading {
+        Reading::new(value, format!("{value:.1} GiB"), format!("{value:.1}G"))
     }
 
     pub fn load(value: f64) -> Reading {
@@ -183,12 +217,13 @@ pub mod format {
         Reading::new(value, text.clone(), text)
     }
 
-    /// Compact byte count, e.g. 0 B, 812 B, 12.4 MB, 3.50 GB.
+    /// Compact byte count in the same binary units the callers divide by, so
+    /// 1536 bytes reads 1.50 KiB and 1023.9 KiB never prints as "1024 KiB".
     pub fn scaled_bytes(value: f64) -> String {
-        let units = ["B", "KB", "MB", "GB", "TB"];
+        let units = ["B", "KiB", "MiB", "GiB", "TiB"];
         let mut amount = if value.is_finite() && value > 0.0 { value } else { 0.0 };
         let mut index = 0;
-        while amount >= 1024.0 && index < units.len() - 1 {
+        while amount.round() >= 1024.0 && index < units.len() - 1 {
             amount /= 1024.0;
             index += 1;
         }
@@ -201,7 +236,7 @@ pub mod format {
         }
     }
 
-    pub fn gigabytes_value(bytes: u64) -> f64 {
+    pub fn gibibytes_value(bytes: u64) -> f64 {
         bytes as f64 / 1_073_741_824.0
     }
 }

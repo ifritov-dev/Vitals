@@ -1,69 +1,56 @@
 //! Text renders of what the app shows, so behaviour can be checked without
 //! photographing the screen.
 
-use std::ffi::CStr;
-
 use crate::model::ALL_CATEGORIES;
 use crate::prefs::Prefs;
 use crate::store::SensorStore;
 
-extern "C" {
-    fn sysctlbyname(
-        name: *const std::ffi::c_char,
-        oldp: *mut std::ffi::c_void,
-        oldlenp: *mut usize,
-        newp: *mut std::ffi::c_void,
-        newlen: usize,
-    ) -> i32;
+/// One sysctl string node, read in two passes. The value is cut at the first
+/// NUL inside the buffer the kernel reported instead of trusting that it
+/// terminated the value exactly there.
+fn sysctl_string(name: &str) -> Option<String> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut size = 0usize;
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size == 0
+    {
+        return None;
+    }
+    let mut buffer = vec![0u8; size];
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buffer.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());
+    Some(String::from_utf8_lossy(&buffer[..end]).into_owned())
 }
 
 pub fn host_summary() -> String {
-    let mut size = 0usize;
-    let name = std::ffi::CString::new("machdep.cpu.brand_string").unwrap();
-    unsafe {
-        if sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) != 0
-            || size == 0
-        {
-            return "unknown host".to_string();
-        }
-        let mut buffer = vec![0i8; size];
-        if sysctlbyname(
-            name.as_ptr(),
-            buffer.as_mut_ptr() as *mut std::ffi::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        ) != 0
-        {
-            return "unknown host".to_string();
-        }
-        let cpu = CStr::from_ptr(buffer.as_ptr()).to_string_lossy().into_owned();
-        format!("{cpu} · macOS {}", platform_version())
-    }
+    let cpu = match sysctl_string("machdep.cpu.brand_string") {
+        Some(cpu) if !cpu.is_empty() => cpu,
+        _ => return "unknown host".to_string(),
+    };
+    format!("{cpu} · macOS {}", platform_version())
 }
 
 fn platform_version() -> String {
-    let name = std::ffi::CString::new("kern.osproductversion").unwrap();
-    let mut size = 0usize;
-    unsafe {
-        if sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) != 0
-            || size == 0
-        {
-            return "?".to_string();
-        }
-        let mut buffer = vec![0i8; size];
-        if sysctlbyname(
-            name.as_ptr(),
-            buffer.as_mut_ptr() as *mut std::ffi::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        ) != 0
-        {
-            return "?".to_string();
-        }
-        CStr::from_ptr(buffer.as_ptr()).to_string_lossy().into_owned()
-    }
+    sysctl_string("kern.osproductversion").unwrap_or_else(|| "?".to_string())
 }
 
 pub fn sensor_dump(store: &mut SensorStore, samples: usize, interval_seconds: f64) -> String {
@@ -81,6 +68,13 @@ pub fn sensor_dump(store: &mut SensorStore, samples: usize, interval_seconds: f6
         store.polled_keys
     ));
 
+    // A negative or non-finite interval panics inside `Duration`, halfway
+    // through a dump that then looks like a crash rather than a bad flag.
+    let interval_seconds = if interval_seconds.is_finite() {
+        interval_seconds.clamp(0.0, 3600.0)
+    } else {
+        0.0
+    };
     for sample in 0..samples.max(1) {
         if sample > 0 {
             std::thread::sleep(std::time::Duration::from_secs_f64(interval_seconds));
@@ -93,7 +87,7 @@ pub fn sensor_dump(store: &mut SensorStore, samples: usize, interval_seconds: f6
                 out.push_str(&format!(
                     "## {}  —  average {}  ·  {} sensor(s)\n",
                     category.title(),
-                    reading.average.text,
+                    reading.describe(None),
                     reading.sensors.len()
                 ));
             } else {
@@ -113,7 +107,8 @@ pub fn sensor_dump(store: &mut SensorStore, samples: usize, interval_seconds: f6
 }
 
 pub fn config_dump(prefs: &Prefs) -> String {
-    let slots: Vec<&str> = prefs.menu_bar.iter().map(|c| c.key()).collect();
+    // The menu bar renders the canonical order, not the insertion order.
+    let slots: Vec<&str> = prefs.ordered_menu_bar().iter().map(|c| c.key()).collect();
     let mut selections: Vec<String> = Vec::new();
     for category in ALL_CATEGORIES {
         let choice = prefs
@@ -123,9 +118,10 @@ pub fn config_dump(prefs: &Prefs) -> String {
         selections.push(format!("{}={}", category.key(), choice));
     }
     format!(
-        "menuBarCategories = {:?}\nrefreshInterval   = {} s\nselections        = {}\n",
+        "menuBarCategories = {:?}\nrefreshInterval   = {} s\nstartAtLogin      = {}\nselections        = {}\n",
         slots,
         prefs.interval,
+        prefs.start_at_login,
         selections.join(", ")
     )
 }

@@ -8,6 +8,7 @@ use crate::objc::{self, Obj};
 const KEY_CATEGORIES: &str = "menuBarCategories";
 const KEY_SELECTIONS: &str = "categorySelections";
 const KEY_INTERVAL: &str = "refreshInterval";
+const KEY_LOGIN: &str = "startAtLogin";
 
 pub const INTERVAL_RANGE: (f64, f64) = (1.0, 10.0);
 pub const DEFAULT_INTERVAL: f64 = 5.0;
@@ -18,6 +19,7 @@ pub struct Prefs {
     pub menu_bar: Vec<Category>,
     pub selections: HashMap<String, String>,
     pub interval: f64,
+    pub start_at_login: bool,
 }
 
 impl Default for Prefs {
@@ -26,8 +28,22 @@ impl Default for Prefs {
             menu_bar: DEFAULT_CATEGORIES.to_vec(),
             selections: HashMap::new(),
             interval: DEFAULT_INTERVAL,
+            start_at_login: false,
         }
     }
+}
+
+/// The string an element of a stored collection holds, or None when it is not
+/// a string at all.
+unsafe fn string_of(value: Obj) -> Option<String> {
+    if value.is_null() || !objc::send_bool_obj(value, "isKindOfClass:", objc::class("NSString")) {
+        return None;
+    }
+    let utf8 = objc::send(value, "UTF8String") as *const std::ffi::c_char;
+    if utf8.is_null() {
+        return None;
+    }
+    Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
 }
 
 fn defaults() -> Obj {
@@ -40,49 +56,36 @@ impl Prefs {
         unsafe {
             let store = defaults();
 
-            let categories = objc::send_obj(store, "objectForKey:", objc::nsstring(KEY_CATEGORIES));
+            // Typed accessors hand back nil instead of raising on a value of
+            // the wrong shape, so a stale or hand-edited domain leaves the
+            // defaults in place rather than killing the launch.
+            let categories = objc::send_obj(store, "arrayForKey:", objc::nsstring(KEY_CATEGORIES));
             if !categories.is_null() {
                 let count = objc::send_int_result(categories, "count");
                 let mut parsed = Vec::new();
                 for index in 0..count {
                     let item = objc::send_int(categories, "objectAtIndex:", index);
-                    if item.is_null() {
-                        continue;
-                    }
-                    let utf8 = objc::send(item, "UTF8String") as *const std::ffi::c_char;
-                    if utf8.is_null() {
-                        continue;
-                    }
-                    let key = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
-                    if let Some(category) = Category::from_key(&key) {
+                    if let Some(category) = string_of(item).and_then(|key| Category::from_key(&key)) {
                         parsed.push(category);
                     }
                 }
-                prefs.menu_bar = parsed;
+                // An array that parses to nothing is a stale shape, not an
+                // empty menu bar, so the defaults stay.
+                if !parsed.is_empty() {
+                    prefs.menu_bar = parsed;
+                }
             }
 
-            let selections = objc::send_obj(store, "objectForKey:", objc::nsstring(KEY_SELECTIONS));
+            let selections = objc::send_obj(store, "dictionaryForKey:", objc::nsstring(KEY_SELECTIONS));
             if !selections.is_null() {
                 let keys = objc::send(selections, "allKeys");
                 let count = objc::send_int_result(keys, "count");
                 for index in 0..count {
                     let key_obj = objc::send_int(keys, "objectAtIndex:", index);
-                    if key_obj.is_null() {
-                        continue;
-                    }
                     let value = objc::send_obj(selections, "objectForKey:", key_obj);
-                    if value.is_null() {
-                        continue;
+                    if let (Some(key), Some(value)) = (string_of(key_obj), string_of(value)) {
+                        prefs.selections.insert(key, value);
                     }
-                    let key_utf8 = objc::send(key_obj, "UTF8String") as *const std::ffi::c_char;
-                    let value_utf8 = objc::send(value, "UTF8String") as *const std::ffi::c_char;
-                    if key_utf8.is_null() || value_utf8.is_null() {
-                        continue;
-                    }
-                    prefs.selections.insert(
-                        std::ffi::CStr::from_ptr(key_utf8).to_string_lossy().into_owned(),
-                        std::ffi::CStr::from_ptr(value_utf8).to_string_lossy().into_owned(),
-                    );
                 }
             }
 
@@ -91,20 +94,34 @@ impl Prefs {
                 prefs.interval = interval;
             }
 
+            let login = objc::send_obj(store, "objectForKey:", objc::nsstring(KEY_LOGIN));
+            if !login.is_null() && objc::send_bool_obj(login, "isKindOfClass:", objc::class("NSNumber")) {
+                prefs.start_at_login = objc::send_bool_result(login, "boolValue");
+            }
+
         }
         prefs
     }
 
-    pub fn save(&self) {
+    /// Writes only the keys a caller actually changed: two instances of the
+    /// app can then keep different settings without overwriting each other.
+    fn save_categories(&self) {
         unsafe {
-            let store = defaults();
-
             let array = objc::send(objc::class("NSMutableArray"), "array");
             for category in &self.menu_bar {
                 objc::send_void_obj(array, "addObject:", objc::nsstring(category.key()));
             }
-            objc::send_void_obj_obj(store, "setObject:forKey:", array, objc::nsstring(KEY_CATEGORIES));
+            objc::send_void_obj_obj(
+                defaults(),
+                "setObject:forKey:",
+                array,
+                objc::nsstring(KEY_CATEGORIES),
+            );
+        }
+    }
 
+    fn save_selections(&self) {
+        unsafe {
             let dictionary = objc::send(objc::class("NSMutableDictionary"), "dictionary");
             for (key, value) in &self.selections {
                 objc::send_void_obj_obj(
@@ -114,11 +131,40 @@ impl Prefs {
                     objc::nsstring(key),
                 );
             }
-            objc::send_void_obj_obj(store, "setObject:forKey:", dictionary, objc::nsstring(KEY_SELECTIONS));
+            objc::send_void_obj_obj(
+                defaults(),
+                "setObject:forKey:",
+                dictionary,
+                objc::nsstring(KEY_SELECTIONS),
+            );
+        }
+    }
 
+    fn save_interval(&self) {
+        unsafe {
             let interval = objc::send_float(objc::class("NSNumber"), "numberWithDouble:", self.interval);
-            objc::send_void_obj_obj(store, "setObject:forKey:", interval, objc::nsstring(KEY_INTERVAL));
+            objc::send_void_obj_obj(
+                defaults(),
+                "setObject:forKey:",
+                interval,
+                objc::nsstring(KEY_INTERVAL),
+            );
+        }
+    }
 
+    fn save_login(&self) {
+        unsafe {
+            let login = objc::send_int(
+                objc::class("NSNumber"),
+                "numberWithBool:",
+                if self.start_at_login { 1 } else { 0 },
+            );
+            objc::send_void_obj_obj(
+                defaults(),
+                "setObject:forKey:",
+                login,
+                objc::nsstring(KEY_LOGIN),
+            );
         }
     }
 
@@ -138,7 +184,8 @@ impl Prefs {
         if !self.menu_bar.contains(&category) {
             self.menu_bar.push(category);
         }
-        self.save();
+        self.save_categories();
+        self.save_selections();
     }
 
     /// Picking a row in a category's submenu is how a category is shown or
@@ -168,14 +215,20 @@ impl Prefs {
 
     pub fn toggle_selection(&mut self, category: Category, sensor: Option<&str>) {
         *self = self.toggled(category, sensor);
-        self.save();
+        self.save_categories();
+        self.save_selections();
     }
 
 
 
+    pub fn set_start_at_login(&mut self, enabled: bool) {
+        self.start_at_login = enabled;
+        self.save_login();
+    }
+
     pub fn set_interval(&mut self, seconds: f64) {
         self.interval = seconds.clamp(INTERVAL_RANGE.0, INTERVAL_RANGE.1);
-        self.save();
+        self.save_interval();
     }
 
     /// Ordered slots, in the canonical category order.

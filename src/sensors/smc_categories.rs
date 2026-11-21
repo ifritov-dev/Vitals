@@ -1,6 +1,6 @@
 //! Temperature, voltage and fan, built from the SMC key table.
 
-use crate::model::{format, Category, CategoryReading, Sensor};
+use crate::model::{format, CategoryReading, Sensor};
 
 pub fn temperature(values: &[(String, f64)]) -> CategoryReading {
     let mut sensors: Vec<Sensor> = values
@@ -17,7 +17,7 @@ pub fn temperature(values: &[(String, f64)]) -> CategoryReading {
         .collect();
     sensors.sort_by(|a, b| a.key.cmp(&b.key));
     if sensors.is_empty() {
-        return CategoryReading::empty(Category::Temperature);
+        return CategoryReading::empty();
     }
     let mean = sensors.iter().map(|s| s.reading.value).sum::<f64>() / sensors.len() as f64;
     CategoryReading {
@@ -41,7 +41,7 @@ pub fn voltage(values: &[(String, f64)]) -> CategoryReading {
         .collect();
     sensors.sort_by(|a, b| a.key.cmp(&b.key));
     if sensors.is_empty() {
-        return CategoryReading::empty(Category::Voltage);
+        return CategoryReading::empty();
     }
     let mean = sensors.iter().map(|s| s.reading.value).sum::<f64>() / sensors.len() as f64;
     CategoryReading {
@@ -73,7 +73,7 @@ pub fn fan(values: &[(String, f64)]) -> CategoryReading {
         .collect();
     sensors.sort_by(|a, b| a.key.cmp(&b.key));
     if sensors.is_empty() {
-        return CategoryReading::empty(Category::Fan);
+        return CategoryReading::empty();
     }
     let mean = sensors.iter().map(|s| s.reading.value).sum::<f64>() / sensors.len() as f64;
     CategoryReading {

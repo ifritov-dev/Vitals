@@ -5,15 +5,39 @@
 //! pointer moves, so the reads run here and the UI only ever applies a
 //! finished snapshot.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
 use crate::model::Category;
+use crate::objc::AutoreleasePool;
 use crate::store::{SensorStore, Snapshot};
 
 /// What a poll should cover: everything, or just the categories on screen.
 enum Request {
     Full,
     Shown(Vec<(Category, Option<String>)>),
+}
+
+impl Request {
+    /// A poll that covers everything answers a narrower request too, so the
+    /// wide one wins when requests arrive while a poll runs.
+    fn absorb(self, next: Request) -> Request {
+        match (self, next) {
+            (Request::Full, _) | (_, Request::Full) => Request::Full,
+            (_, Request::Shown(shown)) => Request::Shown(shown),
+        }
+    }
+}
+
+/// What the UI learns from a poll attempt.
+pub enum Polled {
+    /// Nothing finished yet.
+    Empty,
+    /// A finished poll.
+    Snapshot(Snapshot),
+    /// The worker thread is gone: no snapshot will ever arrive again, which
+    /// is not the same thing as "nothing new yet".
+    Dead,
 }
 
 pub struct Poller {
@@ -28,15 +52,24 @@ impl Poller {
         std::thread::spawn(move || {
             let mut store = SensorStore::new();
             while let Ok(first) = request_rx.recv() {
+                // The sensor reads autorelease strings; a pool per poll keeps
+                // them from piling up for the life of the process.
+                let _pool = AutoreleasePool::new();
                 let mut latest = first;
                 // Requests that arrived while this poll ran are already
                 // answered by it; one poll covers them all.
                 while let Ok(next) = request_rx.try_recv() {
-                    latest = next;
+                    latest = latest.absorb(next);
                 }
-                match latest {
+                // A panic would otherwise kill the thread with its message
+                // going to a stderr nobody reads, freezing the menu bar on the
+                // last reading it received.
+                let polled = catch_unwind(AssertUnwindSafe(|| match latest {
                     Request::Full => store.refresh(),
-                    Request::Shown(shown) => store.refresh_shown(&shown),
+                    Request::Shown(ref shown) => store.refresh_shown(shown),
+                }));
+                if polled.is_err() {
+                    break;
                 }
                 if result_tx.send(store.snapshot()).is_err() {
                     break;
@@ -60,14 +93,23 @@ impl Poller {
     }
 
     /// The newest finished poll, if one landed since the last call.
-    pub fn take_latest(&self) -> Option<Snapshot> {
+    pub fn take(&self) -> Polled {
         let mut latest = None;
         loop {
             match self.results.try_recv() {
                 Ok(snapshot) => latest = Some(snapshot),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return match latest {
+                        Some(snapshot) => Polled::Snapshot(snapshot),
+                        None => Polled::Dead,
+                    }
+                }
             }
         }
-        latest
+        match latest {
+            Some(snapshot) => Polled::Snapshot(snapshot),
+            None => Polled::Empty,
+        }
     }
 }

@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (for example 1.1.0)"
+        required: true
+        type: string
+      draft:
+        description: "Publish the release as a draft"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish the DMG
+    # arm64 runner: the Objective-C interop assumes objc_msgSend's arm64
+    # calling convention, so the Apple Silicon build is the only build.
+    runs-on: macos-14
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Stamp the version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$INPUT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version must look like 1.2.3, got '$INPUT_VERSION'"
+            exit 1
+          fi
+          sed -i '' "s/^version = \".*\"/version = \"$INPUT_VERSION\"/" Cargo.toml
+          grep '^version' Cargo.toml
+          echo "VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build the bundle and the disk image
+        run: make dmg
+
+      - name: Verify the bundle
+        run: |
+          set -euo pipefail
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" dist/Vitals.app/Contents/Info.plist
+          codesign --verify --strict dist/Vitals.app
+          dist/Vitals.app/Contents/MacOS/Vitals --selftest
+          hdiutil verify "dist/Vitals-$VERSION.dmg"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Vitals v${{ env.VERSION }}
+          files: dist/Vitals-${{ env.VERSION }}.dmg
+          draft: ${{ inputs.draft }}
+          generate_release_notes: true
+          body: |
+            macOS menu bar sensor monitor — Apple Silicon (arm64) build.
+
+            **Install:** open `Vitals-${{ env.VERSION }}.dmg`, drag *Vitals* to
+            *Applications*, then launch it.
+
+            The app is signed ad-hoc rather than notarised, so the first launch
+            may be blocked. Either right-click it and choose **Open**, or run:
+
+            ```sh
+            xattr -dr com.apple.quarantine /Applications/Vitals.app
+            ```

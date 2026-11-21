@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::diag;
 use crate::model::{Category, CategoryReading, ALL_CATEGORIES};
+use crate::poller::Polled;
 use crate::objc::{self, NSRunLoopCommonModes, NSSize, Obj, Sel};
 use crate::prefs::Prefs;
 use crate::store::SensorStore;
@@ -34,7 +34,7 @@ struct AppState {
     /// that grows between ticks moves nothing.
     row_tab: f64,
     /// Same, per category, for each submenu.
-    sensor_tabs: [f64; 9],
+    sensor_tabs: [f64; Category::COUNT],
     /// Submenu -> category, so a submenu can be filled when it is about to
     /// open instead of all nine being built with the dropdown.
     submenus: HashMap<usize, Category>,
@@ -51,18 +51,33 @@ struct AppState {
     last_title: String,
     /// The Start at Login row, so its checkmark can follow the toggle.
     login_item: Obj,
+    /// Tag -> sensor id, so a click selects the sensor it names even if the
+    /// list behind the menu was rebuilt with a different order.
+    live_ids: HashMap<isize, String>,
+    /// Tag -> the value text already drawn in that row, so a refresh only
+    /// rebuilds the rows whose reading actually changed.
+    row_values: HashMap<isize, String>,
+    /// How many times the poller thread has been replaced after dying.
+    poller_restarts: u8,
 }
 
-static STATE: Mutex<Option<AppState>> = Mutex::new(None);
-
-// The app is single-threaded: every message, the timer and the menu all run
-// on the main run loop, so the state is only ever touched from one thread.
-unsafe impl Send for AppState {}
+thread_local! {
+    // The app is single-threaded: every message, the timer and the menu run on
+    // the main run loop. A RefCell makes a re-entrant call panic with the place
+    // it happened instead of deadlocking on a lock this thread already holds.
+    static STATE: std::cell::RefCell<Option<AppState>> = const { std::cell::RefCell::new(None) };
+}
 
 fn with_state<R>(body: impl FnOnce(&mut AppState) -> R) -> R {
-    let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    let state = guard.as_mut().expect("state is installed before any message");
-    body(state)
+    STATE.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = borrow.as_mut().expect("state is installed before any message");
+        body(state)
+    })
+}
+
+fn install(state: AppState) {
+    STATE.with(|cell| *cell.borrow_mut() = Some(state));
 }
 
 pub fn prepare_application() {
@@ -84,7 +99,7 @@ pub fn run() {
         let store = SensorStore::for_ui();
         let prefs = Prefs::load();
 
-        *STATE.lock().unwrap() = Some(AppState {
+        install(AppState {
             store,
             prefs,
             controller,
@@ -93,7 +108,7 @@ pub fn run() {
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
-            sensor_tabs: [0.0; 9],
+            sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
             open_submenu: None,
             poller: Some(crate::poller::Poller::start()),
@@ -102,17 +117,15 @@ pub fn run() {
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
+            live_ids: HashMap::new(),
+            row_values: HashMap::new(),
+            poller_restarts: 0,
         });
 
-        with_state(|state| create_status_item(state));
-        with_state(|state| {
-            if let Some(poller) = state.poller.as_ref() {
-                poller.request(true, &[]);
-                schedule_collect(state);
-            }
-        });
-
-        with_state(schedule_ticks);
+        // The slot is born in -applicationDidFinishLaunching:, not here: AppKit
+        // drops a status item created before the app has finished launching,
+        // which made the icon come and go between runs.
+        objc::send_void_obj(app, "setDelegate:", controller);
         let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
 
         if std::env::args().any(|a| a == "--demo-open") {
@@ -156,6 +169,17 @@ pub fn run() {
 
 // MARK: - Runtime class
 
+unsafe extern "C" fn application_did_finish_launching(_this: Obj, _cmd: Sel, _note: Obj) {
+    with_state(|state| create_status_item(state));
+    with_state(|state| {
+        if let Some(poller) = state.poller.as_ref() {
+            poller.request(true, &[]);
+            schedule_collect(state);
+        }
+    });
+    with_state(schedule_ticks);
+}
+
 unsafe extern "C" fn tick_imp(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| tick(state));
 }
@@ -172,42 +196,63 @@ unsafe extern "C" fn menu_needs_update(_this: Obj, _cmd: Sel, menu: Obj) {
 
 unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
     with_state(|state| {
+        if let Some(category) = state.submenus.get(&(menu as usize)).copied() {
+            // A submenu opening inside the dropdown: the dropdown is still the
+            // open menu, and its timer and poll already cover this.
+            state.open_submenu = Some(category);
+            return;
+        }
         state.open_menu = menu;
-        state.open_submenu = state.submenus.get(&(menu as usize)).copied();
-        if state.open_submenu.is_none() {
-            if let Some(poller) = state.poller.as_ref() {
-                poller.request(true, &[]);
-                schedule_collect(state);
-            }
+        state.open_submenu = None;
+        if let Some(poller) = state.poller.as_ref() {
+            poller.request(true, &[]);
+            schedule_collect(state);
         }
         // A menu tracks in NSEventTrackingRunLoopMode, where the regular
-        // ticker does not run; this one keeps the open dropdown live.
-        let controller = state.controller;
-        let timer = objc::send_timer(
-            objc::class("NSTimer"),
-            "timerWithTimeInterval:target:selector:userInfo:repeats:",
-            0.4,
-            controller,
-            objc::selector("collect:"),
-            std::ptr::null_mut(),
-            true,
-        );
-        let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
-        objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, objc::NSEventTrackingRunLoopMode);
-        state.tracking_timer = objc::retain(timer);
+        // ticker does not run; this one keeps the open dropdown live. It is
+        // torn down first: a second timer per open would accumulate for the
+        // life of the process.
+        unsafe {
+            if !state.tracking_timer.is_null() {
+                objc::send_void(state.tracking_timer, "invalidate");
+                objc::release(state.tracking_timer);
+                state.tracking_timer = std::ptr::null_mut();
+            }
+            let timer = objc::send_timer(
+                objc::class("NSTimer"),
+                "timerWithTimeInterval:target:selector:userInfo:repeats:",
+                0.4,
+                state.controller,
+                objc::selector("collect:"),
+                std::ptr::null_mut(),
+                true,
+            );
+            let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
+            objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, objc::NSEventTrackingRunLoopMode);
+            state.tracking_timer = objc::retain(timer);
+        }
     });
 }
 
-unsafe extern "C" fn menu_did_close(_this: Obj, _cmd: Sel, _menu: Obj) {
+unsafe extern "C" fn menu_did_close(_this: Obj, _cmd: Sel, menu: Obj) {
     with_state(|state| {
-        if !state.tracking_timer.is_null() {
-            objc::send_void(state.tracking_timer, "invalidate");
-            objc::release(state.tracking_timer);
-            state.tracking_timer = std::ptr::null_mut();
+        if state.submenus.contains_key(&(menu as usize)) {
+            // A submenu closed while the dropdown stayed open.
+            state.open_submenu = None;
+            return;
+        }
+        unsafe {
+            if !state.tracking_timer.is_null() {
+                objc::send_void(state.tracking_timer, "invalidate");
+                objc::release(state.tracking_timer);
+                state.tracking_timer = std::ptr::null_mut();
+            }
         }
         state.open_menu = std::ptr::null_mut();
         state.open_submenu = None;
-        state.live_items.clear();
+        clear_tracked_items(state);
+        state.live_ids.clear();
+        state.row_values.clear();
     });
 }
 
@@ -224,37 +269,33 @@ unsafe extern "C" fn demo_actions(_this: Obj, _cmd: Sel, _timer: Obj) {
         dispatch(state, category_tag(first, None));
         dispatch(state, category_tag(first, active.is_some().then_some(0)));
         eprintln!("demo: toggling a menu bar category");
-        dispatch(state, -((Category::Battery.index() as isize) + 1));
-        dispatch(state, -((Category::Battery.index() as isize) + 1));
+        let last = ALL_CATEGORIES[Category::COUNT - 1];
+        dispatch(state, category_tag(last, None));
+        dispatch(state, category_tag(last, None));
         eprintln!("demo: changing the interval");
         dispatch(state, TAG_INTERVAL_BASE - 5);
         eprintln!("demo: actions done");
     });
 }
 
+// `cancelTracking` and `performClick:` come straight back into this
+// controller (`menuDidClose:`, `menuWillOpen:`), so the state must be released
+// before they are sent: holding a borrow across them would re-enter it.
 unsafe extern "C" fn demo_close(_this: Obj, _cmd: Sel, _timer: Obj) {
-    with_state(|state| {
-        if !state.open_menu.is_null() {
-            eprintln!("demo: cancelling tracking");
-            objc::send_void(state.open_menu, "cancelTracking");
-            eprintln!("demo: tracking cancelled");
-        }
-    });
+    let menu = with_state(|state| state.open_menu);
+    if !menu.is_null() {
+        objc::send_void(menu, "cancelTracking");
+    }
 }
 
 unsafe extern "C" fn demo_open(_this: Obj, _cmd: Sel, _timer: Obj) {
-    with_state(|state| {
-        {
-            let item = state.status_item;
-            if !item.is_null() {
-                if let Some(button) = button_of(item) {
-                    eprintln!("demo: clicking status item");
-                    objc::send_void_obj(button, "performClick:", std::ptr::null_mut());
-                    eprintln!("demo: menu closed again");
-                }
-            }
-        }
-    });
+    let item = with_state(|state| state.status_item);
+    if item.is_null() {
+        return;
+    }
+    if let Some(button) = button_of(item) {
+        objc::send_void_obj(button, "performClick:", std::ptr::null_mut());
+    }
 }
 
 unsafe extern "C" fn handle_action(_this: Obj, _cmd: Sel, sender: Obj) {
@@ -268,7 +309,8 @@ fn make_controller() -> Obj {
         let cls = objc::objc_allocateClassPair(objc::class("NSObject"), name.as_ptr(), 0);
         let void_obj = CString::new("v@:@").unwrap();
 
-        let methods: [(&str, *const ()); 9] = [
+        let methods: [(&str, *const ()); 10] = [
+            ("applicationDidFinishLaunching:", application_did_finish_launching as *const ()),
             ("tick:", tick_imp as *const ()),
             ("demoOpen:", demo_open as *const ()),
             ("demoClose:", demo_close as *const ()),
@@ -279,10 +321,15 @@ fn make_controller() -> Obj {
             ("menuDidClose:", menu_did_close as *const ()),
             ("handleAction:", handle_action as *const ()),
         ];
+        assert!(!cls.is_null(), "VitalsController is registered twice");
         for (selector_name, implementation) in methods {
             let sel = objc::selector(selector_name);
             let types = void_obj.as_ptr();
-            objc::class_addMethod(cls, sel, implementation as *const std::ffi::c_void, types);
+            let added = objc::class_addMethod(cls, sel, implementation as *const std::ffi::c_void, types);
+            // Every method here is `- (void)name:(id)sender`, so one type
+            // string covers them; a silent miss would leave the app with a
+            // delegate that answers nothing.
+            assert!(added, "{selector_name} could not be installed");
         }
         objc::objc_registerClassPair(cls);
         let instance = objc::send(cls, "new");
@@ -333,21 +380,33 @@ unsafe fn button_of(item: Obj) -> Option<Obj> {
     }
 }
 
+/// What the menu bar slot says: one `key=value;` per shown category.
+///
+/// An empty bar still gets a title, because a status item with neither title
+/// nor image collapses to zero width — the menu would then be unreachable and
+/// the only way back would be editing the preference domain by hand.
+pub fn status_title(prefs: &Prefs, store: &SensorStore) -> String {
+    let categories = prefs.ordered_menu_bar();
+    if categories.is_empty() {
+        return "Vitals".to_string();
+    }
+    categories
+        .iter()
+        .map(|category| {
+            let reading = store.get(*category);
+            let value = reading.reading_for(prefs.selection(*category).map(|s| s.as_str()));
+            format!("{}={};", category.key(), value.compact)
+        })
+        .collect()
+}
+
 fn update_status_titles(state: &mut AppState) {
     unsafe {
         let categories = state.prefs.ordered_menu_bar();
-        let stated = categories
-            .iter()
-            .map(|category| {
-                let reading = state.store.get(*category);
-                let value = reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
-                format!("{}={};", category.key(), value.compact)
-            })
-            .collect::<String>();
+        let stated = status_title(&state.prefs, &state.store);
         if stated == state.last_title && !state.status_item.is_null() {
             return;
         }
-        state.last_title = stated;
         {
             let item = &state.status_item;
             if item.is_null() {
@@ -370,7 +429,7 @@ fn update_status_titles(state: &mut AppState) {
                 } else {
                     "—".to_string()
                 };
-                title.append_symbol(*category, reading);
+                title.append_symbol(*category);
                 title.append_string(&format!("\u{2009}{value}"));
             }
             if title.is_empty() {
@@ -379,6 +438,9 @@ fn update_status_titles(state: &mut AppState) {
             let finished = title.finish();
             objc::send_void_obj(button, "setAttributedTitle:", finished);
             objc::release(finished);
+            // Committed after the draw: a call that found no button must not
+            // leave the cache claiming a title the item never got.
+            state.last_title = stated;
             let tooltip = categories
                 .iter()
                 .map(|category| {
@@ -396,20 +458,37 @@ fn update_status_titles(state: &mut AppState) {
     }
 }
 
+/// Drops the app's own reference to every menu row it tracks. The menu holds
+/// one too, so a row lives until the menu is rebuilt or closed; tracking it
+/// with an unowned pointer is what made a rebuild after a few opens read a
+/// pointer that had already been freed.
+fn clear_tracked_items(state: &mut AppState) {
+    unsafe {
+        for item in state.live_items.drain().map(|(_, item)| item) {
+            objc::release(item);
+        }
+    }
+}
+
 // MARK: - Tick
+
+/// What a poll of the menu bar has to cover.
+fn shown_categories(state: &AppState) -> Vec<(Category, Option<String>)> {
+    state
+        .prefs
+        .ordered_menu_bar()
+        .into_iter()
+        .map(|category| (category, state.prefs.selection(category).cloned()))
+        .collect()
+}
 
 fn tick(state: &mut AppState) {
     // The poll runs on the worker thread, so this only asks for one and then
     // comes back for the result. Nothing is read on the main thread.
     match state.poller.as_ref() {
         Some(poller) => {
-            let shown = state
-                .prefs
-                .ordered_menu_bar()
-                .into_iter()
-                .map(|category| (category, state.prefs.selection(category).cloned()))
-                .collect::<Vec<_>>();
-            poller.request(!state.open_menu.is_null(), &shown);
+            let full = !state.open_menu.is_null();
+            poller.request(full, &shown_categories(state));
             schedule_collect(state);
         }
         None => {
@@ -422,24 +501,59 @@ fn tick(state: &mut AppState) {
 /// Picks up a snapshot the previous tick asked for.
 unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| {
-        if !state.collect_timer.is_null() {
-            objc::release(state.collect_timer);
-            state.collect_timer = std::ptr::null_mut();
+        unsafe {
+            if !state.collect_timer.is_null() {
+                objc::release(state.collect_timer);
+                state.collect_timer = std::ptr::null_mut();
+            }
         }
         let mut fresh = false;
-        if let Some(poller) = state.poller.as_ref() {
-            if let Some(snapshot) = poller.take_latest() {
+        let mut pending = false;
+        match state.poller.as_ref().map(|poller| poller.take()) {
+            Some(Polled::Snapshot(snapshot)) => {
                 state.store.apply(snapshot);
                 fresh = true;
             }
+            Some(Polled::Empty) => pending = true,
+            Some(Polled::Dead) | None => {
+                // The worker died: without this the menu keeps presenting its
+                // last reading as if it were live.
+                restart_poller(state);
+                pending = true;
+            }
+        }
+        if pending && !state.open_menu.is_null() {
+            // The menu is open and the worker has not answered yet; the
+            // tracking timer comes back in 0.4 s, so ask again here instead of
+            // waiting for the refresh interval.
+            if let Some(poller) = state.poller.as_ref() {
+                poller.request(false, &shown_categories(state));
+            }
+            schedule_collect(state);
         }
         show_latest(state, fresh);
     });
 }
 
+/// Replaces a poller whose thread is gone, a bounded number of times: a
+/// deterministic panic would otherwise spin up a thread on every fire.
+fn restart_poller(state: &mut AppState) {
+    state.store = SensorStore::for_ui();
+    if state.poller_restarts >= 3 {
+        state.poller = None;
+        return;
+    }
+    state.poller_restarts += 1;
+    state.poller = Some(crate::poller::Poller::start());
+    if let Some(poller) = state.poller.as_ref() {
+        poller.request(true, &[]);
+    }
+}
+
 fn show_latest(state: &mut AppState, fresh: bool) {
-    if signature(&state.prefs) != state.last_signature {
-        state.last_signature = signature(&state.prefs);
+    let signature = signature(&state.prefs);
+    if signature != state.last_signature {
+        state.last_signature = signature;
         state.last_title.clear();
     }
     update_status_titles(state);
@@ -602,7 +716,9 @@ fn populate(state: &mut AppState, menu: Obj) {
     let _pool = objc::AutoreleasePool::new();
     unsafe {
         objc::send_void(menu, "removeAllItems");
-        state.live_items.clear();
+        clear_tracked_items(state);
+        state.live_ids.clear();
+        state.row_values.clear();
         // The submenus are rebuilt with the dropdown, so the mapping from the
         // previous open's objects is stale from here on.
         state.submenus.clear();
@@ -653,7 +769,6 @@ fn populate(state: &mut AppState, menu: Obj) {
             objc::release(submenu);
             objc::send_void_int(item, "setTag:", row_tag(category));
             objc::send_void_obj(menu, "addItem:", item);
-            objc::release(item);
             state.live_items.insert(row_tag(category), item);
         }
 
@@ -686,10 +801,12 @@ fn populate(state: &mut AppState, menu: Obj) {
         objc::send_void_int(
             login_item,
             "setState:",
-            if crate::login::enabled() { 1 } else { 0 },
+            if state.prefs.start_at_login { 1 } else { 0 },
         );
         objc::send_void_obj(menu, "addItem:", login_item);
-        objc::release(login_item);
+        if !state.login_item.is_null() {
+            objc::release(state.login_item);
+        }
         state.login_item = login_item;
 
         objc::send_void_obj(menu, "addItem:", objc::send(objc::class("NSMenuItem"), "separatorItem"));
@@ -707,6 +824,9 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
         let first_tag = category_tag(category, None) - 1;
         state
             .live_items
+            .retain(|tag, _| *tag < first_tag || *tag >= first_tag + 1000);
+        state
+            .live_ids
             .retain(|tag, _| *tag < first_tag || *tag >= first_tag + 1000);
         // A checkmark means "this row is what the menu bar is showing", so a
         // category that is not in the menu bar has no checked row at all.
@@ -741,7 +861,6 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
             if shown && active.is_none() { 1 } else { 0 },
         );
         objc::send_void_obj(menu, "addItem:", average);
-        objc::release(average);
         state.live_items.insert(category_tag(category, None), average);
 
         if reading.sensors.is_empty() {
@@ -765,85 +884,115 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
             let on = shown && active.as_deref() == Some(sensor.id.as_str());
             objc::send_void_int(item, "setState:", if on { 1 } else { 0 });
             objc::send_void_obj(menu, "addItem:", item);
-            objc::release(item);
             state.live_items.insert(tag, item);
+            state.live_ids.insert(tag, sensor.id.clone());
         }
     }
 }
 
 /// Rewrites the value columns of the menu that is currently open.
+///
+/// Only rows whose value changed are redrawn: this runs off a 0.4 s timer
+/// while a menu tracks, and rebuilding all nine rows and their paragraph
+/// styles each fire is what made the menu stutter.
 fn refresh_values(state: &mut AppState) {
     let _pool = objc::AutoreleasePool::new();
     unsafe {
+        let changed: Vec<(Category, String)> = ALL_CATEGORIES
+            .iter()
+            .copied()
+            .map(|category| (category, row_value_text(state, category)))
+            .filter(|(category, text)| {
+                state.row_values.get(&row_tag(*category)).map(|s| s.as_str()) != Some(text.as_str())
+            })
+            .collect();
+
+        let submenu = state.open_submenu;
+        let submenu_rows: Vec<(isize, String, String)> = match submenu {
+            Some(category) => {
+                let reading = state.store.get(category);
+                let mut rows = vec![(
+                    category_tag(category, None),
+                    "Average".to_string(),
+                    if reading.average.has_data() {
+                        reading.average.text.clone()
+                    } else {
+                        "No data".to_string()
+                    },
+                )];
+                rows.extend(reading.sensors.iter().enumerate().map(|(index, sensor)| {
+                    let left = match display_key(sensor) {
+                        Some(key) => format!("{key}  {}", sensor.label),
+                        None => sensor.label.clone(),
+                    };
+                    (category_tag(category, Some(index)), left, sensor.reading.text.clone())
+                }));
+                rows
+            }
+            None => Vec::new(),
+        };
+        let submenu_changed: Vec<(isize, String, String)> = submenu_rows
+            .into_iter()
+            .filter(|(tag, _, text)| {
+                state.row_values.get(tag).map(|s| s.as_str()) != Some(text.as_str())
+            })
+            .collect();
+
+        if changed.is_empty() && submenu_changed.is_empty() {
+            return;
+        }
+
         // The first open can land before the first poll, when every value is
         // still a placeholder and the column the menu was built with is too
-        // narrow for what arrives a moment later. Recompute it from the values
-        // about to be written, so all rows share one edge.
+        // narrow for what arrives a moment later.
         let labels: Vec<String> = ALL_CATEGORIES
             .iter()
             .map(|category| category.title().to_string())
             .collect();
         let values: Vec<String> = ALL_CATEGORIES
             .iter()
-            .map(|category| {
-                let reading = state.store.get(*category);
-                let value =
-                    reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
-                if value.has_data() {
-                    value.text.clone()
-                } else {
-                    "No data".to_string()
-                }
-            })
+            .map(|category| row_value_text(state, *category))
             .collect();
         let needed = column_right_with(&labels, &values, ICON_SLOT);
         if needed > state.row_tab {
             state.row_tab = needed;
         }
         let row_tab = state.row_tab;
-        for category in ALL_CATEGORIES {
-            let reading = state.store.get(category);
-            let Some(item) = state.live_items.get(&row_tag(category)).copied() else {
+
+        for (category, text) in &changed {
+            let Some(item) = state.live_items.get(&row_tag(*category)).copied() else {
                 continue;
             };
-            let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
             set_row_title_with_symbol(
                 item,
                 Some(category.icon()),
                 category.title(),
-                if value.has_data() { &value.text } else { "No data" },
+                text,
                 row_tab,
                 false,
             );
+            state.row_values.insert(row_tag(*category), text.clone());
         }
 
-        // The sensor rows of the submenu that is on screen, if one is. The
-        // rest are not built, and rebuilding every row of every category on
-        // each tick is what made the menu stutter while the pointer moved.
-        let Some(category) = state.open_submenu else {
+        let Some(category) = submenu else {
             return;
         };
-        let reading = state.store.get(category);
         let sensor_tab = state.sensor_tabs[category.index()];
-        if let Some(item) = state.live_items.get(&category_tag(category, None)).copied() {
-            set_row_title(
-                item,
-                "Average",
-                if reading.average.has_data() { &reading.average.text } else { "No data" },
-                sensor_tab,
-                true,
-            );
-        }
-        for (index, sensor) in reading.sensors.iter().enumerate() {
-            if let Some(item) = state.live_items.get(&category_tag(category, Some(index))).copied() {
-                let left = match display_key(sensor) {
-                    Some(key) => format!("{key}  {}", sensor.label),
-                    None => sensor.label.clone(),
-                };
-                set_row_title(item, &left, &sensor.reading.text, sensor_tab, true);
-            }
+        for (tag, left, text) in &submenu_changed {
+            let Some(item) = state.live_items.get(tag).copied() else {
+                continue;
+            };
+            set_row_title(item, left, text, sensor_tab, true);
+            state.row_values.insert(*tag, text.clone());
         }
     }
+}
+
+fn row_value_text(state: &AppState, category: Category) -> String {
+    state
+        .store
+        .get(category)
+        .describe(state.prefs.selection(category).map(|s| s.as_str()))
 }
 
 fn display_key(sensor: &crate::model::Sensor) -> Option<&str> {
@@ -876,14 +1025,20 @@ fn dispatch(state: &mut AppState, tag: isize) {
         let Some(category) = ALL_CATEGORIES.get(category_index).copied() else {
             return;
         };
-        let reading = state.store.get(category);
+        // The id the row was built for, not the ordinal: a sensor list that
+        // was rebuilt between building the menu and clicking it would
+        // otherwise select a different sensor than the one clicked.
         let selection = if sensor_index == 0 {
             None
         } else {
-            reading
-                .sensors
-                .get(sensor_index - 1)
-                .map(|sensor| sensor.id.clone())
+            state.live_ids.get(&tag).cloned().or_else(|| {
+                state
+                    .store
+                    .get(category)
+                    .sensors
+                    .get(sensor_index - 1)
+                    .map(|sensor| sensor.id.clone())
+            })
         };
         state.prefs.toggle_selection(category, selection.as_deref());
         state.last_title.clear();
@@ -896,13 +1051,21 @@ fn dispatch(state: &mut AppState, tag: isize) {
     }
     match tag {
         TAG_LOGIN => {
-            let _ = crate::login::set(!crate::login::enabled());
+            let enabled = !state.prefs.start_at_login;
+            // The checkmark follows the preference, not the agent file: macOS
+            // deletes that file on its own and the app rebuilds it from here
+            // on the next launch. A failed registration keeps the old value,
+            // so the menu never claims a login item it could not write.
+            match crate::login::apply(enabled) {
+                Ok(()) => state.prefs.set_start_at_login(enabled),
+                Err(error) => eprintln!("start at login: {error}"),
+            }
             if !state.login_item.is_null() {
                 unsafe {
                     objc::send_void_int(
                         state.login_item,
                         "setState:",
-                        if crate::login::enabled() { 1 } else { 0 },
+                        if state.prefs.start_at_login { 1 } else { 0 },
                     );
                 }
             }
@@ -927,7 +1090,6 @@ fn dispatch(state: &mut AppState, tag: isize) {
 
 struct Attributed {
     string: Obj,
-    length: usize,
     empty: bool,
 }
 
@@ -941,7 +1103,6 @@ impl Attributed {
             );
             Attributed {
                 string,
-                length: 0,
                 empty: true,
             }
         }
@@ -956,12 +1117,11 @@ impl Attributed {
             );
             objc::send_void_obj(self.string, "appendAttributedString:", piece);
             objc::release(piece);
-            self.length += text.chars().count();
             self.empty = false;
         }
     }
 
-    fn append_symbol(&mut self, category: Category, _reading: &CategoryReading) {
+    fn append_symbol(&mut self, category: Category) {
         unsafe {
             let Some(font) = crate::icons::font(STATUS_ICON_SIZE) else { return };
             let icon = category.icon().to_string();
@@ -975,7 +1135,6 @@ impl Attributed {
             );
             objc::send_void_obj(self.string, "appendAttributedString:", piece);
             objc::release(piece);
-            self.length += 1;
             self.empty = false;
         }
     }
@@ -1002,7 +1161,6 @@ impl Attributed {
     }
 
 /// Two-column row: label, a tab, then the value ending on `column_right`.
-    ///
     /// The tab is placed where this row's value has to start, not on the
     /// column edge with right alignment. A right-aligned stop makes AppKit
     /// reserve the tab position *and* the value's width when it sizes the
@@ -1052,7 +1210,9 @@ impl Attributed {
                 "initWithString:",
                 objc::nsstring(&text),
             );
-            let full_length = text.chars().count();
+            // NSRange counts UTF-16 units, so a non-BMP character in a label must
+        // not shift the value's font by one.
+        let full_length = text.encode_utf16().count();
             objc::send_attr_range(
                 string,
                 "addAttribute:value:range:",
@@ -1088,7 +1248,7 @@ impl Attributed {
             // The value is always drawn in the font its width was measured
             // with; measuring in one font and drawing in another is what left
             // a different amount of space at the right of every row.
-            let value_start = usize::from(icon.is_some()) + left.chars().count() + 1;
+            let value_start = usize::from(icon.is_some()) + left.encode_utf16().count() + 1;
             objc::send_attr_range(
                 string,
                 "addAttribute:value:range:",
@@ -1133,7 +1293,7 @@ pub fn dump_menu() -> String {
         let mut store = SensorStore::new();
         store.refresh();
         let prefs = Prefs::load();
-        *STATE.lock().unwrap() = Some(AppState {
+        install(AppState {
             store,
             prefs,
             controller,
@@ -1142,7 +1302,7 @@ pub fn dump_menu() -> String {
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
-            sensor_tabs: [0.0; 9],
+            sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
             open_submenu: None,
             poller: None,
@@ -1151,6 +1311,9 @@ pub fn dump_menu() -> String {
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
+            live_ids: HashMap::new(),
+            row_values: HashMap::new(),
+            poller_restarts: 0,
         });
 
         let menu = make_menu(controller);
@@ -1169,7 +1332,7 @@ pub fn dump_menu() -> String {
                 state.prefs.interval,
                 diag::selection_summary(&state.prefs)
             ));
-            fill_all_submenus(state);
+            fill_all_submenus(state, menu);
             let icon_sizes = ALL_CATEGORIES
                 .iter()
                 .map(|category| {
@@ -1323,7 +1486,7 @@ pub fn render_rows(path: &str) {
         let mut store = SensorStore::new();
         store.refresh();
         let prefs = Prefs::load();
-        *STATE.lock().unwrap() = Some(AppState {
+        install(AppState {
             store,
             prefs,
             controller,
@@ -1332,7 +1495,7 @@ pub fn render_rows(path: &str) {
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
-            sensor_tabs: [0.0; 9],
+            sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
             open_submenu: None,
             poller: None,
@@ -1341,6 +1504,9 @@ pub fn render_rows(path: &str) {
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
+            live_ids: HashMap::new(),
+            row_values: HashMap::new(),
+            poller_restarts: 0,
         });
         with_state(|state| {
             let menu = make_menu(state.controller);
@@ -1366,9 +1532,6 @@ pub fn render_rows(path: &str) {
             let height: f64 = rows.iter().map(|(_, h)| h + 6.0).sum::<f64>() + 8.0;
             let image = objc::send_obj_two_floats(objc::alloc("NSImage"), "initWithSize:", width, height);
             objc::send_void(image, "lockFocus");
-            if let Some(background) = Some(objc::send(objc::class("NSColor"), "blackColor")) {
-                let _ = background;
-            }
             let mut y = height - 4.0;
             for (title, row_height) in rows.iter() {
                 y -= row_height + 6.0;
@@ -1381,12 +1544,11 @@ pub fn render_rows(path: &str) {
                 );
                 let manager = objc::send(objc::alloc("NSLayoutManager"), "init");
                 objc::send_void_obj(storage, "addLayoutManager:", manager);
-                let container = objc::send_obj_size_int(
+                let container = objc::send_obj_size(
                     objc::alloc("NSTextContainer"),
-                    "initWithContainerSize:",
+                    "initWithSize:",
                     width,
                     row_height + 6.0,
-                    0,
                 );
                 objc::send_void_obj(manager, "addTextContainer:", container);
                 let glyphs = objc::send_int_result(manager, "numberOfGlyphs") as usize;
@@ -1417,18 +1579,13 @@ pub fn render_rows(path: &str) {
 }
 
 /// Fills every submenu, for the diagnostics dump. The app itself fills one at
-/// a time, when a submenu is opened.
-fn fill_all_submenus(state: &mut AppState) {
+/// a time, when a submenu is opened; the dump has no status item to ask, so it
+/// passes the menu it built.
+fn fill_all_submenus(state: &mut AppState, menu: Obj) {
+    if menu.is_null() {
+        return;
+    }
     unsafe {
-        let categories: Vec<Category> = ALL_CATEGORIES.to_vec();
-        let item = state.status_item;
-        if item.is_null() {
-            return;
-        }
-        let menu = objc::send(item, "menu");
-        if menu.is_null() {
-            return;
-        }
         let items = objc::send(menu, "itemArray");
         let count = objc::send_int_result(items, "count");
         for index in 0..count {
@@ -1440,9 +1597,6 @@ fn fill_all_submenus(state: &mut AppState) {
             let Some(category) = state.submenus.get(&(submenu as usize)).copied() else {
                 continue;
             };
-            if !categories.contains(&category) {
-                continue;
-            }
             let reading = state.store.get(category).clone();
             populate_submenu(state, submenu, category, &reading);
         }
@@ -1457,7 +1611,7 @@ pub fn bench_menu() -> String {
         let mut store = SensorStore::new();
         store.refresh();
         let prefs = Prefs::load();
-        *STATE.lock().unwrap() = Some(AppState {
+        install(AppState {
             store,
             prefs,
             controller,
@@ -1466,7 +1620,7 @@ pub fn bench_menu() -> String {
             open_menu: std::ptr::null_mut(),
             tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
-            sensor_tabs: [0.0; 9],
+            sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
             open_submenu: None,
             poller: None,
@@ -1475,6 +1629,9 @@ pub fn bench_menu() -> String {
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
+            live_ids: HashMap::new(),
+            row_values: HashMap::new(),
+            poller_restarts: 0,
         });
         with_state(|state| {
             let menu = make_menu(state.controller);
@@ -1564,16 +1721,15 @@ unsafe fn name_position(row: Obj, index: usize) -> f64 {
     let storage = objc::send_obj(objc::alloc("NSTextStorage"), "initWithAttributedString:", row);
     let manager = objc::send(objc::alloc("NSLayoutManager"), "init");
     objc::send_void_obj(storage, "addLayoutManager:", manager);
-    let container = objc::send_obj_size_int(
+    let container = objc::send_obj_size(
         objc::alloc("NSTextContainer"),
-        "initWithContainerSize:",
+        "initWithSize:",
         400.0,
         30.0,
-        0,
     );
     objc::send_void_obj(manager, "addTextContainer:", container);
     let glyph = objc::send_int_obj_result2(manager, "glyphIndexForCharacterAtIndex:", index);
-    let x = objc::send_point_int(manager, "locationForGlyphAtIndex:", glyph).0;
+    let x = objc::send_point_int(manager, "locationForGlyphAtIndex:", glyph).width;
     objc::release(manager);
     objc::release(storage);
     objc::release(container);

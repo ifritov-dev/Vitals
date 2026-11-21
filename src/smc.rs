@@ -6,6 +6,8 @@
 
 use std::ffi::{c_char, c_void, CString};
 
+use crate::model::{category_for_key, Category};
+
 const KERNEL_INDEX: u32 = 2;
 const CMD_READ_BYTES: u8 = 5;
 const CMD_READ_INDEX: u8 = 8;
@@ -39,6 +41,8 @@ struct KeyDataKeyInfo {
     data_attributes: u8,
 }
 
+/// `vers` and `p_limit` are never read: they hold the driver's offsets at 4
+/// and 12, so deleting them (as "unused fields") silently breaks every call.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct KeyData {
@@ -52,6 +56,11 @@ struct KeyData {
     data32: u32,
     bytes: [u8; 32],
 }
+
+// The layout invariant is checked at compile time: a runtime assert would
+// only fire inside the polling thread, leaving the UI frozen instead of
+// refusing to build.
+const _: () = assert!(std::mem::size_of::<KeyData>() == 80);
 
 impl Default for KeyData {
     fn default() -> Self {
@@ -91,6 +100,10 @@ pub struct SmcService {
     connection: u32,
     pub total_keys: usize,
     pub specs: Vec<Spec>,
+    /// Consecutive driver failures: a connection that keeps failing is
+    /// dropped by the store and re-opened instead of answering "No data"
+    /// forever.
+    failures: std::cell::Cell<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,11 +115,6 @@ pub struct Spec {
 
 impl SmcService {
     pub fn open() -> Option<SmcService> {
-        assert_eq!(
-            std::mem::size_of::<KeyData>(),
-            80,
-            "the SMC wire struct must stay 80 bytes"
-        );
         unsafe {
             let name = CString::new("AppleSMC").ok()?;
             let matching = IOServiceMatching(name.as_ptr());
@@ -127,6 +135,7 @@ impl SmcService {
                 connection,
                 total_keys: 0,
                 specs: Vec::new(),
+                failures: std::cell::Cell::new(0),
             };
             service.load_keys();
             Some(service)
@@ -147,9 +156,17 @@ impl SmcService {
             )
         };
         if kr != 0 || output.result != 0 {
+            self.failures.set(self.failures.get() + 1);
             return None;
         }
+        self.failures.set(0);
         Some(output)
+    }
+
+    /// Whether the driver is still answering. The store re-opens the
+    /// connection once it is not.
+    pub fn healthy(&self) -> bool {
+        self.failures.get() < 5
     }
 
     fn key_info(&self, key: &str) -> Option<(u32, String)> {
@@ -195,12 +212,24 @@ impl SmcService {
         let Some(bytes) = self.read_bytes("#KEY", size) else {
             return;
         };
-        let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        // The driver reports the key count in four bytes; a bogus value there
+        // would otherwise mean millions of driver calls at startup.
+        let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).min(4096);
         self.total_keys = count as usize;
 
         let mut specs = Vec::new();
+        let mut misses = 0;
         for index in 0..count {
-            let Some(key) = self.key_at(index) else { continue };
+            // Indices are contiguous, so a run of misses means the enumeration
+            // itself failed rather than that a key is absent.
+            let Some(key) = self.key_at(index) else {
+                misses += 1;
+                if misses >= 3 {
+                    break;
+                }
+                continue;
+            };
+            misses = 0;
             if !is_interesting(&key) {
                 continue;
             }
@@ -268,19 +297,16 @@ fn four_cc(key: &str) -> Option<u32> {
     )
 }
 
-/// Only these keys are polled after startup.
+/// Only these keys are polled after startup. The prefix-to-category rule
+/// itself lives in the model, so enumeration and the store cannot drift.
 fn is_interesting(key: &str) -> bool {
     let b = key.as_bytes();
-    if b.len() != 4 {
-        return false;
+    match category_for_key(key) {
+        Some(Category::Fan) => b[2] == b'A' && b[3] == b'c' && b[1].is_ascii_digit(),
+        Some(Category::Battery) => matches!(key, "B0AV" | "B0AC"),
+        Some(_) => true,
+        None => false,
     }
-    if b[0] == b'T' || b[0] == b'V' {
-        return true;
-    }
-    if b[0] == b'F' && b[2] == b'A' && b[3] == b'c' && b[1].is_ascii_digit() {
-        return true;
-    }
-    matches!(key, "B0AV" | "B0AC")
 }
 
 /// Decodes one payload according to its SMC type string.
