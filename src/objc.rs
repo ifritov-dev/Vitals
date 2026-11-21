@@ -273,6 +273,14 @@ pub unsafe fn send_obj_size(obj: Obj, sel: &str, width: f64, height: f64) -> Obj
     function(obj, selector(sel), width, height)
 }
 
+/// `-popUpMenuPositioningItem:atLocation:inView:` — an item, a point in two
+/// float registers, then a view.
+pub unsafe fn send_void_item_point_view(obj: Obj, sel: &str, item: Obj, x: f64, y: f64, view: Obj) {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, f64, f64, Obj) =
+        transmute(objc_msgSend as *const ());
+    function(obj, selector(sel), item, x, y, view);
+}
+
 pub unsafe fn send_void_range_point(obj: Obj, sel: &str, location: usize, length: usize, x: f64, y: f64) {
     let function: unsafe extern "C" fn(Obj, Sel, usize, usize, f64, f64) =
         transmute(objc_msgSend as *const ());

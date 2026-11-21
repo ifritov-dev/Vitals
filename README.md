@@ -62,7 +62,15 @@ have put there, and clicking it opens the dropdown.
 - **Choosing a sensor** — picking a sensor shows that sensor in the menu bar;
   picking the row that is already active removes the category from the bar.
 - **Refresh Interval** — 1 to 10 seconds, 5 by default. Only the categories on
-  the menu bar are polled; the rest keep their last reading.
+  the menu bar are polled, and the dropdown follows the same interval while it
+  is open; the rest keep their last reading.
+- **Fixed Status Width** — keeps the menu bar item at the width the categories
+  on it need, so a reading that grows ("9°" to "100°") widens it once instead
+  of shifting the whole bar on every refresh. Turn it off to let the item size
+  itself to whatever it currently says.
+- **Row toggles keep the menu open** — choosing a sensor, an interval or either
+  switch re-opens the dropdown where it was, so several changes can be made
+  without clicking the status item again.
 - **Start at Login** — a LaunchAgent in `~/Library/LaunchAgents`. macOS
   sometimes deletes that file on its own (background item management prunes
   agents it has registered too often), so the setting is stored in
@@ -72,6 +80,29 @@ have put there, and clicking it opens the dropdown.
 Readings update in place while the menu is open, and a sensor whose key stops
 answering falls back to *No data* after three misses rather than showing a
 stale number forever.
+
+## Updates
+
+Vitals updates itself from the releases published on GitHub. Every launch
+checks the latest release once, and the dropdown carries a row above **Quit
+Vitals** that reads *Check for Updates*. When that release is newer than the
+running build the row becomes *Update to vX.Y.Z*; choosing it downloads the DMG
+from that release, verifies and mounts the image, copies the bundle inside over
+the copy in `/Applications`, and relaunches the new one. The check is a bounded
+`curl` call to the GitHub API, because a binary with one dependency has no TLS
+stack of its own to use.
+
+Three limits are worth knowing before you rely on it:
+
+- **It only updates an installed copy.** If `/Applications/Vitals.app` is not
+  there the row refuses and says so, rather than installing a second app you
+  would not open; a build run out of `dist/` is not something to replace.
+- **The download is ad-hoc signed, not notarised.** Gatekeeper trusts it the
+  same way it trusts the DMG you install by hand, so the quarantine flag the
+  download carries is cleared after the swap and the new copy starts without a
+  second confirmation.
+- **A check needs the network.** A failed check, like a rate-limited one, is
+  reported in the menu and leaves the installed app untouched.
 
 ## Command line
 
@@ -89,6 +120,7 @@ app bundle, because that is the preference domain the app reads.
 | `--bench-menu` | Times the dropdown build, a submenu build, a live refresh and the poll paths |
 | `--render-rows <path.png>` | Draws the dropdown's rows offscreen for checking the layout |
 | `--print-config` | Shown categories, interval, login item and selections |
+| `--check-updates` | Current version and whether a newer release exists (network) |
 | `--set-selection <category> [--sensor <id>]` | Saves a choice without opening the menu (writes prefs, bundle only) |
 | `--login-status` | Preference, agent file and launchd job state |
 | `--set-login on\|off` | Enables or disables the login item (writes prefs, bundle only) |
@@ -157,6 +189,10 @@ builds.
 and `Info.plist`, builds the arm64 bundle, signs it ad-hoc, packages
 `dist/Vitals-<version>.dmg`, verifies the bundle with `--selftest`, and
 publishes a GitHub release tagged `v<version>` with the DMG attached.
+
+That published release is also what the running app consumes: installing the
+update is a copy of the DMG's bundle, so a version only reaches installed copies
+once it has a release.
 
 ## Licence
 

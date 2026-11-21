@@ -118,10 +118,11 @@ pub fn config_dump(prefs: &Prefs) -> String {
         selections.push(format!("{}={}", category.key(), choice));
     }
     format!(
-        "menuBarCategories = {:?}\nrefreshInterval   = {} s\nstartAtLogin      = {}\nselections        = {}\n",
+        "menuBarCategories = {:?}\nrefreshInterval   = {} s\nstartAtLogin      = {}\nfixedStatusWidth  = {}\nselections        = {}\n",
         slots,
         prefs.interval,
         prefs.start_at_login,
+        prefs.fixed_status_width,
         selections.join(", ")
     )
 }

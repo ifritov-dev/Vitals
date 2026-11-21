@@ -1,6 +1,6 @@
 //! Categories, readings and their display strings.
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Category {
     Temperature,
     Voltage,

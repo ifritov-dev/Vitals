@@ -10,6 +10,7 @@ mod sensors;
 mod smc;
 mod store;
 mod ui;
+mod update;
 
 use model::Category;
 use prefs::Prefs;
@@ -87,12 +88,28 @@ fn main() {
 
     let headless = args.iter().any(|a| {
         a == "--print-config"
+            || a == "--check-updates"
             || a == "--bench-menu"
             || a == "--login-status"
             || a.starts_with("--set-")
             || a.starts_with("--render")
     });
     if !headless && !login::claim_single_instance() {
+        return;
+    }
+
+    // The check is one bounded network call and needs none of the app's state,
+    // so a diagnostic can report exactly what the menu would show.
+    if args.iter().any(|a| a == "--check-updates") {
+        println!("current version {}", update::current_version());
+        match update::check() {
+            Ok(Some(found)) => println!("update available: {} {}", found.version, found.dmg_url),
+            Ok(None) => println!("up to date"),
+            Err(error) => {
+                eprintln!("update check failed: {error}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 

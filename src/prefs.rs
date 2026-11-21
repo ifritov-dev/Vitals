@@ -9,6 +9,7 @@ const KEY_CATEGORIES: &str = "menuBarCategories";
 const KEY_SELECTIONS: &str = "categorySelections";
 const KEY_INTERVAL: &str = "refreshInterval";
 const KEY_LOGIN: &str = "startAtLogin";
+const KEY_FIXED_WIDTH: &str = "fixedStatusWidth";
 
 pub const INTERVAL_RANGE: (f64, f64) = (1.0, 10.0);
 pub const DEFAULT_INTERVAL: f64 = 5.0;
@@ -20,6 +21,9 @@ pub struct Prefs {
     pub selections: HashMap<String, String>,
     pub interval: f64,
     pub start_at_login: bool,
+    /// Pin the menu bar item to the width its categories need, instead of
+    /// letting it size itself to whatever the readings currently say.
+    pub fixed_status_width: bool,
 }
 
 impl Default for Prefs {
@@ -29,6 +33,7 @@ impl Default for Prefs {
             selections: HashMap::new(),
             interval: DEFAULT_INTERVAL,
             start_at_login: false,
+            fixed_status_width: true,
         }
     }
 }
@@ -94,6 +99,11 @@ impl Prefs {
                 prefs.interval = interval;
             }
 
+            let fixed = objc::send_obj(store, "objectForKey:", objc::nsstring(KEY_FIXED_WIDTH));
+            if !fixed.is_null() && objc::send_bool_obj(fixed, "isKindOfClass:", objc::class("NSNumber")) {
+                prefs.fixed_status_width = objc::send_bool_result(fixed, "boolValue");
+            }
+
             let login = objc::send_obj(store, "objectForKey:", objc::nsstring(KEY_LOGIN));
             if !login.is_null() && objc::send_bool_obj(login, "isKindOfClass:", objc::class("NSNumber")) {
                 prefs.start_at_login = objc::send_bool_result(login, "boolValue");
@@ -148,6 +158,22 @@ impl Prefs {
                 "setObject:forKey:",
                 interval,
                 objc::nsstring(KEY_INTERVAL),
+            );
+        }
+    }
+
+    fn save_fixed_width(&self) {
+        unsafe {
+            let value = objc::send_int(
+                objc::class("NSNumber"),
+                "numberWithBool:",
+                if self.fixed_status_width { 1 } else { 0 },
+            );
+            objc::send_void_obj_obj(
+                defaults(),
+                "setObject:forKey:",
+                value,
+                objc::nsstring(KEY_FIXED_WIDTH),
             );
         }
     }
@@ -220,6 +246,11 @@ impl Prefs {
     }
 
 
+
+    pub fn set_fixed_status_width(&mut self, enabled: bool) {
+        self.fixed_status_width = enabled;
+        self.save_fixed_width();
+    }
 
     pub fn set_start_at_login(&mut self, enabled: bool) {
         self.start_at_login = enabled;

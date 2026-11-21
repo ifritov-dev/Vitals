@@ -162,6 +162,7 @@ pub fn run() -> Outcome {
         selections: HashMap::new(),
         interval: 5.0,
         start_at_login: false,
+        fixed_status_width: true,
     };
     let shown = base.toggled(Category::Processor, Some("PROC_0"));
     out.check(
@@ -185,6 +186,102 @@ pub fn run() -> Outcome {
         other.menu_bar.contains(&Category::Processor)
             && other.selection(Category::Processor).map(|s| s.as_str()) == Some("PROC_1"),
     );
+    // The release the update engine reads, as GitHub answers for a real one:
+    // escapes in the body, and the DMG after a sources archive.
+    let release = r#"{
+  "url": "https://api.github.com/repos/ifritov-dev/Vitals/releases/428311",
+  "html_url": "https://github.com/ifritov-dev/Vitals/releases/tag/v1.2.0",
+  "id": 428311,
+  "tag_name": "v1.2.0",
+  "target_commitish": "main",
+  "name": "Vitals 1.2.0",
+  "draft": false,
+  "prerelease": false,
+  "body": "Fan readings no longer go stale\n\n- the \"maximum\" curve is back\n- a body that says \"tag_name\" must not confuse the reader",
+  "assets": [
+    {"name": "vitals-1.2.0-sources.tar.gz", "browser_download_url": "https://example.test/sources.tar.gz"},
+    {"name": "Vitals-1.2.0.dmg", "browser_download_url": "https://example.test/Vitals-1.2.0.dmg"},
+    {"name": "Vitals-1.2.0.dmg.sha256", "browser_download_url": "https://example.test/checksum"}
+  ]
+}"#;
+    let parsed = crate::update::parse_release(release);
+    out.check(
+        "release tag loses its v",
+        parsed.as_ref().map(|u| u.version.as_str()) == Some("1.2.0"),
+    );
+    out.check(
+        "release picks the dmg asset",
+        parsed.as_ref().map(|u| u.dmg_url.as_str())
+            == Some("https://example.test/Vitals-1.2.0.dmg"),
+    );
+    // The body is the only field where escapes and multi-line text arrive, and
+    // the menu renders it verbatim.
+    out.check(
+        "release notes keep their lines and quotes",
+        parsed
+            .as_ref()
+            .map(|u| {
+                u.notes.starts_with("Fan readings no longer go stale\n\n- the \"maximum\"")
+                    && u.notes.contains("\"tag_name\"")
+            })
+            .unwrap_or(false),
+    );
+    // A release body that quotes key names arrives before the real fields, and
+    // reading it as structure would place the update on the wrong asset.
+    let quoting = crate::update::parse_release(
+        r#"{"body": "we changed \"browser_download_url\" and \"name\": \"evil.dmg\"", "tag_name": "v0.9.0", "assets": [{"name": "Vitals-0.9.0.dmg", "browser_download_url": "https://example.test/Vitals-0.9.0.dmg"}]}"#,
+    );
+    out.check(
+        "keys quoted inside the body are not fields",
+        quoting
+            .as_ref()
+            .map(|u| u.version.as_str() == "0.9.0")
+            .unwrap_or(false)
+            && quoting.as_ref().map(|u| u.dmg_url.as_str())
+                == Some("https://example.test/Vitals-0.9.0.dmg"),
+    );
+    out.check(
+        "truncated release is nil",
+        crate::update::parse_release("{").is_none()
+            && crate::update::parse_release(r#"{"tag_name": "v1.2.0", "assets": ["#).is_none()
+            && crate::update::parse_release(
+                r#"{"assets": [{"name": "Vitals-1.2.0.dmg", "browser_download_url": "#,
+            )
+            .is_none(),
+    );
+
+    use std::cmp::Ordering;
+    out.check(
+        "same version is equal",
+        crate::update::compare("1.0.0", "1.0.0") == Ordering::Equal,
+    );
+    out.check(
+        "newer minor is greater",
+        crate::update::compare("1.1.0", "1.0.9") == Ordering::Greater,
+    );
+    out.check(
+        "older patch is less",
+        crate::update::compare("1.0.9", "1.1.0") == Ordering::Less,
+    );
+    // Numeric, not lexical: 1.10 follows 1.9.
+    out.check(
+        "components compare as numbers",
+        crate::update::compare("1.10.0", "1.9.9") == Ordering::Greater,
+    );
+    out.check(
+        "a leading v is decoration",
+        crate::update::compare("v1.0.0", "1.0.0") == Ordering::Equal,
+    );
+    out.check(
+        "pre-release suffix names the release it leads to",
+        crate::update::compare("1.2.0-rc1", "1.2.0") == Ordering::Equal
+            && crate::update::compare("1.3.0-beta.2", "1.2.0") == Ordering::Greater,
+    );
+    out.check(
+        "current version is the crate's own",
+        crate::update::current_version() == env!("CARGO_PKG_VERSION"),
+    );
+
     out.check("percent text", format::percent(57.859).text == "57.9%");
     out.check(
         "temperature text",

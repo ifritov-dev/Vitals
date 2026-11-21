@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::diag;
@@ -15,10 +16,22 @@ use crate::poller::Polled;
 use crate::objc::{self, NSRunLoopCommonModes, NSSize, Obj, Sel};
 use crate::prefs::Prefs;
 use crate::store::SensorStore;
+use crate::update::Update;
 
 const TAG_QUIT: isize = -22;
 const TAG_LOGIN: isize = -23;
+const TAG_UPDATE: isize = -24;
+const TAG_FIXED_WIDTH: isize = -25;
 const TAG_INTERVAL_BASE: isize = -30;
+
+/// A check that has not answered in this long is treated as failed. curl is
+/// bounded, so this only catches a wedged worker, and it is what keeps the row
+/// from sitting on "Checking for Updates…" forever.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The same for an install, which has a 100 MB download and two mounts to do.
+const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+/// How long the row keeps saying "up to date" after a check found nothing.
+const CURRENT_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 
 struct AppState {
     store: SensorStore,
@@ -28,7 +41,6 @@ struct AppState {
     /// Tag -> menu item, so open menus can be updated in place.
     live_items: HashMap<isize, Obj>,
     open_menu: Obj,
-    tracking_timer: Obj,
     last_signature: String,
     /// Value column of the dropdown, fixed while the menu is open so a value
     /// that grows between ticks moves nothing.
@@ -59,6 +71,322 @@ struct AppState {
     row_values: HashMap<isize, String>,
     /// How many times the poller thread has been replaced after dying.
     poller_restarts: u8,
+    /// Width remembered for each slot on the bar, at its widest so far, with
+    /// the text it was measured from.
+    status_slots: HashMap<Category, (String, f64)>,
+    /// Width of the two spaces between slots, measured once.
+    status_separator: f64,
+    /// The length currently set on the status item.
+    status_length: f64,
+    /// The Check for Updates row, so its label can change the moment an answer
+    /// lands instead of waiting for the next rebuild.
+    update_item: Obj,
+    /// Reopens the dropdown after a row was chosen, so a toggle does not shut
+    /// the menu on every click.
+    reopen_timer: Obj,
+    /// The Check for Updates row and the pipe a worker thread answers down.
+    updates: Updates,
+}
+
+/// The update row's state, and the pipe a worker thread hands its answer down.
+///
+/// `update::check` and `update::install` block on curl and on hdiutil for as
+/// long as the network and the disk take, and the app's state is a
+/// thread-local only the main thread may touch. So the work runs on a plain
+/// thread that owns nothing but the slot it writes into, and a short timer on
+/// the main run loop picks the answer up from there.
+struct Updates {
+    status: UpdateStatus,
+    /// The release the row offers, once a check found one.
+    found: Option<Update>,
+    /// True from the moment a worker starts until its answer is applied, so a
+    /// second click cannot start a second one.
+    busy: bool,
+    /// Whether the check in flight was asked for by a click. The quiet check
+    /// at launch says nothing when it finds nothing, so the row keeps
+    /// offering a check instead of claiming the app is current forever.
+    announced: bool,
+    /// When a check finished and found nothing: the row says so until then,
+    /// and offers a check again after it. A result belongs to the minutes it
+    /// was made in.
+    current_until: Option<Instant>,
+    /// When the work in flight stops being believable; the watchdog in
+    /// `update_poll` clears the row when a worker never answers.
+    deadline: Option<Instant>,
+    /// Written by the worker, read by the main thread, and nothing else crosses.
+    outcome: Arc<Mutex<Option<Outcome>>>,
+    /// Polls `outcome` while a worker runs; invalidated as soon as it lands.
+    timer: Obj,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateStatus {
+    /// Nothing in flight. With a release in `found`, the row offers to install
+    /// it — that is what a check that found something leaves behind, so a
+    /// silent check at launch needs no state of its own.
+    Idle,
+    Checking,
+    Current,
+    Installing,
+    Failed,
+}
+
+/// What a worker thread hands back to the main thread.
+enum Outcome {
+    /// A check ran: the release it found, or None when this build is newest.
+    Checked(Option<Update>),
+    /// The new copy has replaced the installed one and is already running.
+    Installed,
+    /// Whatever ran failed, with the words the app would print.
+    Failed(String),
+}
+
+impl Updates {
+    /// No check has run yet: the state the app starts in and the headless
+    /// dumps build their menu from.
+    fn idle() -> Updates {
+        Updates {
+            status: UpdateStatus::Idle,
+            found: None,
+            busy: false,
+            announced: false,
+            current_until: None,
+            deadline: None,
+            outcome: Arc::new(Mutex::new(None)),
+            timer: std::ptr::null_mut(),
+        }
+    }
+
+    /// The row's label and whether a click on it does anything.
+    ///
+    /// The dropdown is rebuilt from this every time it opens, so a result that
+    /// arrived while the menu was closed is what the next open shows.
+    fn row(&self) -> (String, bool) {
+        let status = self.effective_status();
+        let label = match (&status, &self.found) {
+            (UpdateStatus::Idle, Some(update)) => format!("Update to v{}", update.version),
+            // The quiet check at launch leaves the label alone; a click while
+            // it is out only makes it announce itself.
+            (UpdateStatus::Idle, None) => "Check for Updates".to_string(),
+            (UpdateStatus::Checking, _) => "Checking for Updates…".to_string(),
+            (UpdateStatus::Current, _) => format!(
+                "Vitals is up to date · v{}",
+                crate::update::current_version()
+            ),
+            (UpdateStatus::Installing, _) => "Updating…".to_string(),
+            (UpdateStatus::Failed, _) => "Update check failed — try again".to_string(),
+        };
+        // Only the two states with work of their own in flight refuse a click;
+        // up to date and failed both mean "check again", which is harmless.
+        let enabled = !matches!(
+            status,
+            UpdateStatus::Checking | UpdateStatus::Installing
+        );
+        (label, enabled)
+    }
+
+    /// The state the row shows, with an expired "up to date" read as idle.
+    fn effective_status(&self) -> UpdateStatus {
+        match (self.status, self.current_until) {
+            (UpdateStatus::Current, Some(until)) if Instant::now() >= until => UpdateStatus::Idle,
+            (status, _) => status,
+        }
+    }
+
+    /// One line naming the state, for the headless menu dump.
+    fn summary(&self) -> String {
+        let status = self.effective_status();
+        match (&status, &self.found) {
+            (UpdateStatus::Idle, Some(update)) => format!("update available: v{}", update.version),
+            (UpdateStatus::Idle, None) => "idle".to_string(),
+            (UpdateStatus::Checking, _) => "checking".to_string(),
+            (UpdateStatus::Current, _) => {
+                format!("up to date: v{}", crate::update::current_version())
+            }
+            (UpdateStatus::Installing, _) => "installing".to_string(),
+            (UpdateStatus::Failed, _) => "failed".to_string(),
+        }
+    }
+
+    /// What a click on the row does, read from the same state `row` shows.
+    fn activate(&mut self, controller: Obj) {
+        match self.effective_status() {
+            UpdateStatus::Idle if self.found.is_some() => self.begin_install(controller),
+            UpdateStatus::Idle | UpdateStatus::Current | UpdateStatus::Failed => {
+                self.begin_check(controller, true)
+            }
+            UpdateStatus::Checking | UpdateStatus::Installing => {}
+        }
+    }
+
+    /// Asks GitHub for the newest release. `announce` puts "Checking for
+    /// Updates…" on the row; the launch check leaves it quiet.
+    fn begin_check(&mut self, controller: Obj, announce: bool) {
+        if self.busy {
+            // A check is already out. A click that asked for one shows it as
+            // running, since that is the truth the user asked to see.
+            if announce {
+                self.status = UpdateStatus::Checking;
+            }
+            return;
+        }
+        self.busy = true;
+        self.found = None;
+        self.current_until = None;
+        self.deadline = Some(Instant::now() + CHECK_TIMEOUT);
+        self.announced = announce;
+        if announce {
+            self.status = UpdateStatus::Checking;
+        }
+        self.spawn(controller, || match crate::update::check() {
+            Ok(Some(update)) => Outcome::Checked(Some(update)),
+            Ok(None) => Outcome::Checked(None),
+            Err(error) => Outcome::Failed(error),
+        });
+    }
+
+    /// Replaces the installed app with the release the row offers.
+    fn begin_install(&mut self, controller: Obj) {
+        if self.busy {
+            return;
+        }
+        let Some(update) = self.found.take() else { return };
+        self.busy = true;
+        self.deadline = Some(Instant::now() + INSTALL_TIMEOUT);
+        self.status = UpdateStatus::Installing;
+        self.spawn(controller, move || match crate::update::install(&update) {
+            Ok(()) => Outcome::Installed,
+            Err(error) => Outcome::Failed(error),
+        });
+    }
+
+    /// Runs `work` on a thread of its own and starts watching for its answer.
+    fn spawn(&mut self, controller: Obj, work: impl FnOnce() -> Outcome + Send + 'static) {
+        let slot = Arc::clone(&self.outcome);
+        std::thread::spawn(move || {
+            // A panicking worker would otherwise leave the row saying
+            // "Checking…" until the app is restarted, so the panic becomes an
+            // answer like any other.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|_| Outcome::Failed("the update worker stopped".to_string()));
+            // The slot holds one answer and this thread is its only writer, so
+            // a poisoned lock still carries everything the main thread needs.
+            *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(outcome);
+        });
+        self.schedule_poll(controller);
+    }
+
+    /// Arms the timer that watches for the worker's answer: short, because the
+    /// answer is only a lock away, and cancelled the moment it is applied.
+    fn schedule_poll(&mut self, controller: Obj) {
+        unsafe {
+            if !self.timer.is_null() {
+                objc::send_void(self.timer, "invalidate");
+                objc::release(self.timer);
+                self.timer = std::ptr::null_mut();
+            }
+            let timer = objc::send_timer(
+                objc::class("NSTimer"),
+                "timerWithTimeInterval:target:selector:userInfo:repeats:",
+                0.25,
+                controller,
+                objc::selector("updatePoll:"),
+                std::ptr::null_mut(),
+                true,
+            );
+            arm_timer(timer);
+            self.timer = objc::retain(timer);
+        }
+    }
+
+    /// Rewrites the visible Check for Updates row from the state machine, so a
+/// result shows up in the open menu instead of only on the next open. This is
+/// what made a fast check look like a slow one.
+fn refresh_update_row(state: &mut AppState) {
+    if state.update_item.is_null() {
+        return;
+    }
+    let (title, enabled) = state.updates.row();
+    unsafe {
+        objc::send_void_obj(state.update_item, "setTitle:", objc::nsstring(&title));
+        objc::send_void_int(state.update_item, "setEnabled:", if enabled { 1 } else { 0 });
+    }
+}
+
+/// Returns the row to "Check for Updates" once the menu closes: the result
+    /// of a check belongs to the moment it was made, not to the next open.
+    fn dismiss(&mut self) {
+        // "Up to date" outlives the menu on purpose: it is the answer to a
+        // question just asked. A failure is reported the same way, so both
+        // stay until something replaces them.
+    }
+
+    /// Fails the work in flight when its worker has gone quiet, so the row can
+    /// never sit on "Checking for Updates…" for good.
+    fn timed_out(&mut self) -> bool {
+        if !self.busy {
+            return false;
+        }
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        // The worker keeps its own slot, so a late answer lands nowhere
+        // instead of overwriting the state a later check is using.
+        self.outcome = Arc::new(Mutex::new(None));
+        self.busy = false;
+        self.deadline = None;
+        self.status = UpdateStatus::Failed;
+        unsafe {
+            if !self.timer.is_null() {
+                objc::send_void(self.timer, "invalidate");
+                objc::release(self.timer);
+                self.timer = std::ptr::null_mut();
+            }
+        }
+        eprintln!("update: the worker did not answer in time");
+        true
+    }
+
+    /// Applies an answer. True means a new copy of the app is already running,
+    /// so this instance has to terminate.
+    fn finish(&mut self, outcome: Outcome) -> bool {
+        unsafe {
+            if !self.timer.is_null() {
+                objc::send_void(self.timer, "invalidate");
+                objc::release(self.timer);
+                self.timer = std::ptr::null_mut();
+            }
+        }
+        self.busy = false;
+        self.deadline = None;
+        match outcome {
+            Outcome::Checked(Some(update)) => {
+                self.found = Some(update);
+                self.status = UpdateStatus::Idle;
+            }
+            Outcome::Checked(None) => {
+                // Only a check the user asked for reports the result; the one
+                // at launch leaves the row alone.
+                self.status = if self.announced {
+                    self.current_until = Some(Instant::now() + CURRENT_FOR);
+                    UpdateStatus::Current
+                } else {
+                    UpdateStatus::Idle
+                };
+            }
+            Outcome::Installed => return true,
+            Outcome::Failed(error) => {
+                // The row's label has to stay one line, so the reason goes
+                // where every other failure in this app goes.
+                eprintln!("update: {error}");
+                self.status = UpdateStatus::Failed;
+            }
+        }
+        false
+    }
 }
 
 thread_local! {
@@ -106,7 +434,6 @@ pub fn run() {
             status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
-            tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
             sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
@@ -120,6 +447,12 @@ pub fn run() {
             live_ids: HashMap::new(),
             row_values: HashMap::new(),
             poller_restarts: 0,
+            status_slots: HashMap::new(),
+            status_separator: 0.0,
+            status_length: 0.0,
+            update_item: std::ptr::null_mut(),
+            reopen_timer: std::ptr::null_mut(),
+            updates: Updates::idle(),
         });
 
         // The slot is born in -applicationDidFinishLaunching:, not here: AppKit
@@ -178,10 +511,66 @@ unsafe extern "C" fn application_did_finish_launching(_this: Obj, _cmd: Sel, _no
         }
     });
     with_state(schedule_ticks);
+    // Once, and quietly: a newer release is on the row by the time the menu is
+    // first opened, while a check that fails here only prints its reason, since
+    // nobody asked for it and the row still offers a fresh check.
+    with_state(|state| {
+        let controller = state.controller;
+        state.updates.begin_check(controller, false);
+    });
 }
 
 unsafe extern "C" fn tick_imp(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| tick(state));
+}
+
+/// Collects what an update worker thread left behind.
+///
+/// This is the only place a check or an install crosses back into the main
+/// thread: the worker wrote one `Outcome` into a slot it shares with nobody
+/// else, and everything that touches the app state — and AppKit with it —
+/// happens here, on the run loop.
+/// Rewrites the visible Check for Updates row from the state machine, so a
+/// result shows up in the open menu instead of only on the next rebuild. This
+/// is what made a fast check look like a slow one: the worker had answered,
+/// and the row still said "Checking…" because nothing repainted it.
+fn refresh_update_row(state: &mut AppState) {
+    if state.update_item.is_null() {
+        return;
+    }
+    let (title, enabled) = state.updates.row();
+    unsafe {
+        objc::send_void_obj(state.update_item, "setTitle:", objc::nsstring(&title));
+        objc::send_void_int(state.update_item, "setEnabled:", if enabled { 1 } else { 0 });
+    }
+}
+
+unsafe extern "C" fn update_poll(_this: Obj, _cmd: Sel, _timer: Obj) {
+    let replaced = with_state(|state| {
+        let outcome = state
+            .updates
+            .outcome
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        let replaced = match outcome {
+            Some(outcome) => state.updates.finish(outcome),
+            None => {
+                state.updates.timed_out();
+                false
+            }
+        };
+        refresh_update_row(state);
+        replaced
+    });
+    if replaced {
+        // `update::install` already started the new copy, so leaving this one
+        // running would put two icons in the menu bar.
+        unsafe {
+            let app = objc::send(objc::class("NSApplication"), "sharedApplication");
+            objc::send_void_obj(app, "terminate:", std::ptr::null_mut());
+        }
+    }
 }
 
 unsafe extern "C" fn menu_needs_update(_this: Obj, _cmd: Sel, menu: Obj) {
@@ -198,38 +587,17 @@ unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
     with_state(|state| {
         if let Some(category) = state.submenus.get(&(menu as usize)).copied() {
             // A submenu opening inside the dropdown: the dropdown is still the
-            // open menu, and its timer and poll already cover this.
+            // open menu, and its poll already covers this.
             state.open_submenu = Some(category);
             return;
         }
         state.open_menu = menu;
         state.open_submenu = None;
+        // Fresh data the moment the menu opens; from here the refresh tick,
+        // which runs in the tracking mode too, is what keeps it live.
         if let Some(poller) = state.poller.as_ref() {
             poller.request(true, &[]);
             schedule_collect(state);
-        }
-        // A menu tracks in NSEventTrackingRunLoopMode, where the regular
-        // ticker does not run; this one keeps the open dropdown live. It is
-        // torn down first: a second timer per open would accumulate for the
-        // life of the process.
-        unsafe {
-            if !state.tracking_timer.is_null() {
-                objc::send_void(state.tracking_timer, "invalidate");
-                objc::release(state.tracking_timer);
-                state.tracking_timer = std::ptr::null_mut();
-            }
-            let timer = objc::send_timer(
-                objc::class("NSTimer"),
-                "timerWithTimeInterval:target:selector:userInfo:repeats:",
-                0.4,
-                state.controller,
-                objc::selector("collect:"),
-                std::ptr::null_mut(),
-                true,
-            );
-            let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
-            objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, objc::NSEventTrackingRunLoopMode);
-            state.tracking_timer = objc::retain(timer);
         }
     });
 }
@@ -241,15 +609,9 @@ unsafe extern "C" fn menu_did_close(_this: Obj, _cmd: Sel, menu: Obj) {
             state.open_submenu = None;
             return;
         }
-        unsafe {
-            if !state.tracking_timer.is_null() {
-                objc::send_void(state.tracking_timer, "invalidate");
-                objc::release(state.tracking_timer);
-                state.tracking_timer = std::ptr::null_mut();
-            }
-        }
         state.open_menu = std::ptr::null_mut();
         state.open_submenu = None;
+        state.updates.dismiss();
         clear_tracked_items(state);
         state.live_ids.clear();
         state.row_values.clear();
@@ -300,7 +662,74 @@ unsafe extern "C" fn demo_open(_this: Obj, _cmd: Sel, _timer: Obj) {
 
 unsafe extern "C" fn handle_action(_this: Obj, _cmd: Sel, sender: Obj) {
     let tag = with_state(|_| unsafe { objc::send_int_result(sender, "tag") });
-    with_state(|state| dispatch(state, tag));
+    with_state(|state| {
+        dispatch(state, tag);
+        // Choosing a row closes an NSMenu; the toggles here are meant to be
+        // flipped a few times in a row, so the dropdown is put back as soon as
+        // the click has been handled. Quit is the one row that means it.
+        if tag != TAG_QUIT {
+            schedule_reopen(state);
+        }
+    });
+}
+
+/// Reopens the dropdown a moment from now.
+///
+/// Reopening from inside the action runs a tracking loop inside the one that
+/// is still unwinding, so it is deferred by a short timer instead.
+fn schedule_reopen(state: &mut AppState) {
+    unsafe {
+        if !state.reopen_timer.is_null() {
+            objc::send_void(state.reopen_timer, "invalidate");
+            objc::release(state.reopen_timer);
+            state.reopen_timer = std::ptr::null_mut();
+        }
+        let timer = objc::send_timer(
+            objc::class("NSTimer"),
+            "timerWithTimeInterval:target:selector:userInfo:repeats:",
+            0.05,
+            state.controller,
+            objc::selector("reopenMenu:"),
+            std::ptr::null_mut(),
+            false,
+        );
+        arm_timer(timer);
+        state.reopen_timer = objc::retain(timer);
+    }
+}
+
+/// Puts the dropdown back under the status item, after releasing the state:
+/// the menu tracks until the next choice, and everything it calls back into
+/// needs the borrow.
+unsafe extern "C" fn reopen_menu(_this: Obj, _cmd: Sel, _timer: Obj) {
+    let (item, menu) = with_state(|state| {
+        unsafe {
+            if !state.reopen_timer.is_null() {
+                objc::release(state.reopen_timer);
+                state.reopen_timer = std::ptr::null_mut();
+            }
+        }
+        if state.status_item.is_null() {
+            return (std::ptr::null_mut(), std::ptr::null_mut());
+        }
+        let item = state.status_item;
+        (item, unsafe { objc::send(item, "menu") })
+    });
+    if item.is_null() || menu.is_null() {
+        return;
+    }
+    let Some(button) = button_of(item) else { return };
+    let height = unsafe { objc::send_size(button, "bounds").height };
+    unsafe {
+        objc::send_void_item_point_view(
+            menu,
+            "popUpMenuPositioningItem:atLocation:inView:",
+            std::ptr::null_mut(),
+            0.0,
+            height,
+            button,
+        );
+    }
 }
 
 fn make_controller() -> Obj {
@@ -309,13 +738,15 @@ fn make_controller() -> Obj {
         let cls = objc::objc_allocateClassPair(objc::class("NSObject"), name.as_ptr(), 0);
         let void_obj = CString::new("v@:@").unwrap();
 
-        let methods: [(&str, *const ()); 10] = [
+        let methods: [(&str, *const ()); 12] = [
             ("applicationDidFinishLaunching:", application_did_finish_launching as *const ()),
             ("tick:", tick_imp as *const ()),
             ("demoOpen:", demo_open as *const ()),
             ("demoClose:", demo_close as *const ()),
             ("demoActions:", demo_actions as *const ()),
             ("collect:", collect as *const ()),
+            ("reopenMenu:", reopen_menu as *const ()),
+            ("updatePoll:", update_poll as *const ()),
             ("menuNeedsUpdate:", menu_needs_update as *const ()),
             ("menuWillOpen:", menu_will_open as *const ()),
             ("menuDidClose:", menu_did_close as *const ()),
@@ -352,7 +783,9 @@ fn create_status_item(state: &mut AppState) {
     unsafe {
         let bar = objc::send(objc::class("NSStatusBar"), "systemStatusBar");
         // +statusItemWithLength: hands back an autoreleased item, and the
-        // pointer we keep has to outlive the pool that created it.
+        // pointer we keep has to outlive the pool that created it. It is born
+        // variable and pinned by the first title render, which is where the
+        // width is measured from the readings on the bar.
         let item = objc::retain(objc::send_float(bar, "statusItemWithLength:", -1.0));
         let menu = make_menu(state.controller);
         objc::send_void_obj(item, "setMenu:", menu);
@@ -400,6 +833,152 @@ pub fn status_title(prefs: &Prefs, store: &SensorStore) -> String {
         .collect()
 }
 
+/// What one slot of the menu bar shows: its reading as the slot prints it, or
+/// a dash when there is none.
+fn status_slot_text(reading: &crate::model::Reading) -> String {
+    if reading.has_data() {
+        reading.compact.clone()
+    } else {
+        "—".to_string()
+    }
+}
+
+/// Appends `text` in `font`, one run of an attributed string.
+unsafe fn append_run(string: Obj, text: &str, font: Obj) {
+    let attributes = objc::send(objc::class("NSMutableDictionary"), "dictionary");
+    objc::send_void_obj_obj(attributes, "setObject:forKey:", font, objc::nsstring("NSFont"));
+    let piece = objc::send_obj_obj(
+        objc::alloc("NSAttributedString"),
+        "initWithString:attributes:",
+        objc::nsstring(text),
+        attributes,
+    );
+    objc::send_void_obj(string, "appendAttributedString:", piece);
+    objc::release(piece);
+}
+
+unsafe fn status_value_font() -> Obj {
+    objc::send_obj_two_floats(
+        objc::class("NSFont"),
+        "monospacedDigitSystemFontOfSize:weight:",
+        objc::system_font_size(),
+        0.0,
+    )
+}
+
+/// Width of one slot: its icon glyph, a thin space, then the value, in the
+/// fonts the title is drawn with.
+unsafe fn slot_width(category: Option<Category>, value: &str) -> f64 {
+    let _pool = objc::AutoreleasePool::new();
+    let font = status_value_font();
+    let run = objc::send_obj(
+        objc::alloc("NSMutableAttributedString"),
+        "initWithString:",
+        objc::nsstring(""),
+    );
+    if let Some(category) = category {
+        if let Some(icon_font) = crate::icons::font(STATUS_ICON_SIZE) {
+            append_run(run, &category.icon().to_string(), icon_font);
+        }
+    }
+    append_run(run, &format!("\u{2009}{value}"), font);
+    let width = objc::send_size(run, "size").width;
+    objc::release(run);
+    width.ceil()
+}
+
+/// Sizes the status item to what is on the bar, and does it on the bar's
+/// terms rather than the widgets: each slot is measured from the reading it is
+/// actually showing, so a bar with one category stays as narrow as one
+/// category.
+///
+/// Nothing moves while a value changes shape, because the width remembered for
+/// a slot only ever grows: "9°" becoming "100°" widens the widget once, and
+/// the next refresh that reads "43°" does not shrink it back and shift the
+/// whole item sideways. Shrinking happens only when a category leaves the bar,
+/// which is when the length is recomputed from the categories still there.
+fn status_slots(state: &AppState) -> Vec<(Category, String)> {
+    state
+        .prefs
+        .ordered_menu_bar()
+        .into_iter()
+        .map(|category| {
+            let reading = state.store.get(category);
+            let value = reading.reading_for(state.prefs.selection(category).map(|s| s.as_str()));
+            (category, status_slot_text(value))
+        })
+        .collect()
+}
+
+/// The length these slots measure, with nothing remembered in between.
+fn measured_status_length(slots: &[(Category, String)]) -> f64 {
+    let _pool = objc::AutoreleasePool::new();
+    unsafe {
+        let mut total = STATUS_SLOT_PADDING;
+        if slots.is_empty() {
+            total += slot_width(None, "Vitals");
+        }
+        for (index, (category, value)) in slots.iter().enumerate() {
+            if index > 0 {
+                total += slot_width(None, "  ");
+            }
+            total += slot_width(Some(*category), value);
+        }
+        total.ceil()
+    }
+}
+
+fn apply_status_length(state: &mut AppState, slots: &[(Category, String)]) {
+    if state.status_item.is_null() {
+        return;
+    }
+    if !state.prefs.fixed_status_width {
+        // Off: the item sizes itself to whatever the readings say, which is
+        // the AppKit default and what the row toggles back to.
+        if state.status_length > 0.0 {
+            state.status_length = 0.0;
+            unsafe {
+                objc::send_void_float(state.status_item, "setLength:", -1.0);
+            }
+        }
+        return;
+    }
+    let total = unsafe {
+        let separator = if state.status_separator > 0.0 {
+            state.status_separator
+        } else {
+            let measured = slot_width(None, "  ");
+            state.status_separator = measured;
+            measured
+        };
+        let mut total = STATUS_SLOT_PADDING;
+        if slots.is_empty() {
+            // The empty bar still says this, and that title is the only way
+            // back to the menu.
+            total += slot_width(None, "Vitals");
+        }
+        for (index, (category, value)) in slots.iter().enumerate() {
+            if index > 0 {
+                total += separator;
+            }
+            let width = match state.status_slots.get(category) {
+                Some((text, width)) if text == value => *width,
+                _ => slot_width(Some(*category), value),
+            };
+            state.status_slots.insert(*category, (value.clone(), width));
+            total += width;
+        }
+        total.ceil()
+    };
+    if (total - state.status_length).abs() < 0.5 {
+        return;
+    }
+    state.status_length = total;
+    unsafe {
+        objc::send_void_float(state.status_item, "setLength:", total);
+    }
+}
+
 fn update_status_titles(state: &mut AppState) {
     unsafe {
         let categories = state.prefs.ordered_menu_bar();
@@ -413,22 +992,23 @@ fn update_status_titles(state: &mut AppState) {
                 return;
             }
             let Some(button) = button_of(*item) else { return };
+            let slots: Vec<(Category, String)> = categories
+                .iter()
+                .map(|category| {
+                    let reading = state.store.get(*category);
+                    let value = reading
+                        .reading_for(state.prefs.selection(*category).map(|s| s.as_str()));
+                    (*category, status_slot_text(value))
+                })
+                .collect();
+            // Sized from the readings about to be drawn, so the item is never
+            // narrower than its content and never wider than it needs.
+            apply_status_length(state, &slots);
             let mut title = Attributed::new();
-            for (index, category) in categories.iter().enumerate() {
+            for (index, (category, value)) in slots.iter().enumerate() {
                 if index > 0 {
                     title.append_string("  ");
                 }
-                let reading = state.store.get(*category);
-                let value = state
-                    .prefs
-                    .selection(*category)
-                    .map(|id| reading.reading_for(Some(id.as_str())).compact.clone())
-                    .unwrap_or_else(|| reading.average.compact.clone());
-                let value = if reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str())).has_data() {
-                    value
-                } else {
-                    "—".to_string()
-                };
                 title.append_symbol(*category);
                 title.append_string(&format!("\u{2009}{value}"));
             }
@@ -498,7 +1078,11 @@ fn tick(state: &mut AppState) {
     }
 }
 
-/// Picks up a snapshot the previous tick asked for.
+/// Picks up a snapshot a tick asked for.
+///
+/// It applies whatever arrived and arms nothing of its own: a snapshot that is
+/// not ready yet is simply collected by the next refresh tick, so the menu
+/// updates on the interval the user configured whether it is open or closed.
 unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
     with_state(|state| {
         unsafe {
@@ -507,30 +1091,19 @@ unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
                 state.collect_timer = std::ptr::null_mut();
             }
         }
-        let mut fresh = false;
-        let mut pending = false;
-        match state.poller.as_ref().map(|poller| poller.take()) {
+        let fresh = match state.poller.as_ref().map(|poller| poller.take()) {
             Some(Polled::Snapshot(snapshot)) => {
                 state.store.apply(snapshot);
-                fresh = true;
+                true
             }
-            Some(Polled::Empty) => pending = true,
-            Some(Polled::Dead) | None => {
+            Some(Polled::Dead) => {
                 // The worker died: without this the menu keeps presenting its
                 // last reading as if it were live.
                 restart_poller(state);
-                pending = true;
+                false
             }
-        }
-        if pending && !state.open_menu.is_null() {
-            // The menu is open and the worker has not answered yet; the
-            // tracking timer comes back in 0.4 s, so ask again here instead of
-            // waiting for the refresh interval.
-            if let Some(poller) = state.poller.as_ref() {
-                poller.request(false, &shown_categories(state));
-            }
-            schedule_collect(state);
-        }
+            Some(Polled::Empty) | None => false,
+        };
         show_latest(state, fresh);
     });
 }
@@ -557,11 +1130,29 @@ fn show_latest(state: &mut AppState, fresh: bool) {
         state.last_title.clear();
     }
     update_status_titles(state);
-    // Only rows that show a changed reading are worth rebuilding; while a menu
-    // is open this runs off a 0.4 s timer, most of which bring no new sample.
+    // Only rows that show a changed reading are worth rebuilding, and they are
+    // rebuilt once per refresh interval, on the same tick as the menu bar.
     if fresh && !state.open_menu.is_null() {
         refresh_values(state);
     }
+}
+
+/// Adds `timer` to the main run loop for both common modes and event tracking.
+///
+/// A menu tracks in NSEventTrackingRunLoopMode, where a timer registered for
+/// the common modes alone does not run. Being in both is what lets one cadence
+/// serve an open menu and a closed one: the refresh tick keeps firing while
+/// the dropdown is held open, so the menu redraws on the interval the user
+/// picked instead of on a timer of its own.
+unsafe fn arm_timer(timer: Obj) {
+    let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
+    objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, NSRunLoopCommonModes);
+    objc::send_void_obj_obj(
+        run_loop,
+        "addTimer:forMode:",
+        timer,
+        objc::NSEventTrackingRunLoopMode,
+    );
 }
 
 /// Arms the one-shot timer that collects the poll requested a moment ago.
@@ -581,8 +1172,7 @@ fn schedule_collect(state: &mut AppState) {
             std::ptr::null_mut(),
             false,
         );
-        let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
-        objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, NSRunLoopCommonModes);
+        arm_timer(timer);
         state.collect_timer = objc::retain(timer);
     }
 }
@@ -607,8 +1197,7 @@ fn schedule_ticks(state: &mut AppState) {
             true,
         );
         objc::send_void_float(timer, "setTolerance:", (interval * 0.25).max(0.2));
-        let run_loop = objc::send(objc::class("NSRunLoop"), "mainRunLoop");
-        objc::send_void_obj_obj(run_loop, "addTimer:forMode:", timer, NSRunLoopCommonModes);
+        arm_timer(timer);
         state.tick_timer = objc::retain(timer);
     }
 }
@@ -678,6 +1267,9 @@ const COLUMN_GUTTER: f64 = 22.0;
 const ICON_BOX: f64 = 14.0;
 /// Icon size in the menu bar, where the text is 13 pt.
 const STATUS_ICON_SIZE: f64 = 13.0;
+/// Room the bar button leaves either side of its title, so a slot measured to
+/// the text alone would clip it.
+const STATUS_SLOT_PADDING: f64 = 10.0;
 /// Where every category name starts when the row has an icon.
 const ICON_SLOT: f64 = 22.0;
 
@@ -797,6 +1389,15 @@ fn populate(state: &mut AppState, menu: Obj) {
         objc::send_void_obj(menu, "addItem:", interval_item);
         objc::release(interval_item);
 
+        let fixed_width = action_item("Fixed Status Width", state.controller, TAG_FIXED_WIDTH);
+        objc::send_void_int(
+            fixed_width,
+            "setState:",
+            if state.prefs.fixed_status_width { 1 } else { 0 },
+        );
+        objc::send_void_obj(menu, "addItem:", fixed_width);
+        objc::release(fixed_width);
+
         let login_item = action_item("Start at Login", state.controller, TAG_LOGIN);
         objc::send_void_int(
             login_item,
@@ -808,6 +1409,16 @@ fn populate(state: &mut AppState, menu: Obj) {
             objc::release(state.login_item);
         }
         state.login_item = login_item;
+
+
+        let (title, enabled) = state.updates.row();
+        let update = action_item(&title, state.controller, TAG_UPDATE);
+        objc::send_void_int(update, "setEnabled:", if enabled { 1 } else { 0 });
+        objc::send_void_obj(menu, "addItem:", update);
+        if !state.update_item.is_null() {
+            objc::release(state.update_item);
+        }
+        state.update_item = update;
 
         objc::send_void_obj(menu, "addItem:", objc::send(objc::class("NSMenuItem"), "separatorItem"));
         let quit = action_item("Quit Vitals", state.controller, TAG_QUIT);
@@ -892,8 +1503,8 @@ fn populate_submenu(state: &mut AppState, menu: Obj, category: Category, reading
 
 /// Rewrites the value columns of the menu that is currently open.
 ///
-/// Only rows whose value changed are redrawn: this runs off a 0.4 s timer
-/// while a menu tracks, and rebuilding all nine rows and their paragraph
+/// Only rows whose value changed are redrawn: this runs on every refresh tick
+/// while a menu is open, and rebuilding all nine rows and their paragraph
 /// styles each fire is what made the menu stutter.
 fn refresh_values(state: &mut AppState) {
     let _pool = objc::AutoreleasePool::new();
@@ -1041,9 +1652,9 @@ fn dispatch(state: &mut AppState, tag: isize) {
             })
         };
         state.prefs.toggle_selection(category, selection.as_deref());
-        state.last_title.clear();
-        refresh_values(state);
-        update_status_titles(state);
+        // Picking a row can add or remove the category, so the title and the
+        // fixed length both come from the path that watches the category set.
+        show_latest(state, true);
         return;
     }
     if tag == 0 {
@@ -1071,10 +1682,28 @@ fn dispatch(state: &mut AppState, tag: isize) {
             }
             return;
         }
+        TAG_FIXED_WIDTH => {
+            let enabled = !state.prefs.fixed_status_width;
+            state.prefs.set_fixed_status_width(enabled);
+            // Both directions have to take effect now: pinning measures the
+            // current readings, unpinning hands the width back to AppKit.
+            state.last_title.clear();
+            let slots = status_slots(state);
+            apply_status_length(state, &slots);
+            update_status_titles(state);
+            return;
+        }
         TAG_QUIT => unsafe {
             let app = objc::send(objc::class("NSApplication"), "sharedApplication");
             objc::send_void_obj(app, "terminate:", std::ptr::null_mut());
         },
+        TAG_UPDATE => {
+            // The worker and its polling timer are the only things this starts;
+            // the row's next open redraws from whatever state they leave.
+            let controller = state.controller;
+            state.updates.activate(controller);
+            refresh_update_row(state);
+        }
         other if other <= -31 && other >= -40 => {
             let seconds = (-other - 30) as f64;
             state.prefs.set_interval(seconds);
@@ -1300,7 +1929,6 @@ pub fn dump_menu() -> String {
             status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
-            tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
             sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
@@ -1314,6 +1942,12 @@ pub fn dump_menu() -> String {
             live_ids: HashMap::new(),
             row_values: HashMap::new(),
             poller_restarts: 0,
+            status_slots: HashMap::new(),
+            status_separator: 0.0,
+            status_length: 0.0,
+            update_item: std::ptr::null_mut(),
+            reopen_timer: std::ptr::null_mut(),
+            updates: Updates::idle(),
         });
 
         let menu = make_menu(controller);
@@ -1321,7 +1955,7 @@ pub fn dump_menu() -> String {
         with_state(|state| {
             populate(state, menu);
             out.push_str(&format!(
-                "# menu bar slots: {}\n# refresh interval: {} s\n# selections: {}\n",
+                "# menu bar slots: {}\n# refresh interval: {} s\n# selections: {}\n# status item width: {:.1} pt (fixed)\n# updates: {}\n",
                 state
                     .prefs
                     .ordered_menu_bar()
@@ -1330,7 +1964,9 @@ pub fn dump_menu() -> String {
                     .collect::<Vec<_>>()
                     .join(", "),
                 state.prefs.interval,
-                diag::selection_summary(&state.prefs)
+                diag::selection_summary(&state.prefs),
+                measured_status_length(&status_slots(state)),
+                state.updates.summary()
             ));
             fill_all_submenus(state, menu);
             let icon_sizes = ALL_CATEGORIES
@@ -1493,7 +2129,6 @@ pub fn render_rows(path: &str) {
             status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
-            tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
             sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
@@ -1507,6 +2142,12 @@ pub fn render_rows(path: &str) {
             live_ids: HashMap::new(),
             row_values: HashMap::new(),
             poller_restarts: 0,
+            status_slots: HashMap::new(),
+            status_separator: 0.0,
+            status_length: 0.0,
+            update_item: std::ptr::null_mut(),
+            reopen_timer: std::ptr::null_mut(),
+            updates: Updates::idle(),
         });
         with_state(|state| {
             let menu = make_menu(state.controller);
@@ -1618,7 +2259,6 @@ pub fn bench_menu() -> String {
             status_item: std::ptr::null_mut(),
             live_items: HashMap::new(),
             open_menu: std::ptr::null_mut(),
-            tracking_timer: std::ptr::null_mut(),
             row_tab: 0.0,
             sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
@@ -1632,6 +2272,12 @@ pub fn bench_menu() -> String {
             live_ids: HashMap::new(),
             row_values: HashMap::new(),
             poller_restarts: 0,
+            status_slots: HashMap::new(),
+            status_separator: 0.0,
+            status_length: 0.0,
+            update_item: std::ptr::null_mut(),
+            reopen_timer: std::ptr::null_mut(),
+            updates: Updates::idle(),
         });
         with_state(|state| {
             let menu = make_menu(state.controller);
