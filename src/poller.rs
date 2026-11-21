@@ -46,7 +46,10 @@ pub struct Poller {
 }
 
 impl Poller {
-    pub fn start() -> Poller {
+    /// Starts the worker. `wake` runs on a successful poll, from the worker
+    /// thread: it is what tells the main run loop a snapshot exists, so the UI
+    /// needs no timer to go looking for one.
+    pub fn start(wake: fn()) -> Poller {
         let (request_tx, request_rx) = channel::<Request>();
         let (result_tx, result_rx) = channel::<Snapshot>();
         std::thread::spawn(move || {
@@ -74,6 +77,7 @@ impl Poller {
                 if result_tx.send(store.snapshot()).is_err() {
                     break;
                 }
+                wake();
             }
         });
         Poller {

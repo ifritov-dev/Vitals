@@ -33,11 +33,13 @@ const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900)
 /// How long the row keeps saying "up to date" after a check found nothing.
 const CURRENT_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// How long the row that collects a poll keeps looking for it. The first poll
-/// of a session opens the driver and enumerates its keys, which takes longer
-/// than one wait; a result nobody collects until the next refresh tick leaves
-/// the menu showing the numbers it had before the app restarted.
-const COLLECT_RETRIES: u8 = 20;
+/// After this many seconds without input the bar refreshes on its own slow
+/// cadence: a number nobody is looking at does not need a wakeup every few
+/// seconds, and an idle screen is most of a laptop's day.
+const IDLE_AFTER: f64 = 120.0;
+/// The cadence used while the user is away. Long enough to be nearly free,
+/// short enough that a glance after coming back shows a live number.
+const IDLE_INTERVAL: f64 = 20.0;
 
 struct AppState {
     store: SensorStore,
@@ -60,14 +62,12 @@ struct AppState {
     open_submenu: Option<Category>,
     /// Reads sensors off the main thread; only the GUI runs one.
     poller: Option<crate::poller::Poller>,
-    /// Fires once per refresh interval.
+    /// Fires once per refresh interval, and is re-armed by the tick itself.
     tick_timer: Obj,
-    /// One-shot timer that picks up the snapshot a tick asked for.
-    collect_timer: Obj,
-    /// How many times that timer has looked again for a poll still running,
-    /// so a slow first poll is collected early and a wedged one is not chased
-    /// for ever.
-    collect_waits: u8,
+    /// False while the menu bar cannot be seen: the display is asleep, the
+    /// screen is locked or another user is logged in. Neither polling nor
+    /// drawing is worth a wakeup then, so the whole loop stops.
+    bar_visible: bool,
     /// What the menu bar currently says, so an unchanged reading is not
     /// redrawn.
     last_title: String,
@@ -426,10 +426,9 @@ pub fn run() {
             sensor_tabs: [0.0; Category::COUNT],
             submenus: HashMap::new(),
             open_submenu: None,
-            poller: Some(crate::poller::Poller::start()),
+            poller: Some(crate::poller::Poller::start(wake_main)),
             tick_timer: std::ptr::null_mut(),
-            collect_timer: std::ptr::null_mut(),
-            collect_waits: 0,
+            bar_visible: true,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
@@ -496,10 +495,10 @@ unsafe extern "C" fn application_did_finish_launching(_this: Obj, _cmd: Sel, _no
     with_state(|state| {
         if let Some(poller) = state.poller.as_ref() {
             poller.request(true, &[]);
-            schedule_collect(state);
         }
     });
     with_state(schedule_ticks);
+    with_state(|state| watch_screen_state(state.controller));
     // Once, and quietly: a newer release is on the row by the time the menu is
     // first opened, while a check that fails here only prints its reason, since
     // nobody asked for it and the row still offers a fresh check.
@@ -586,7 +585,6 @@ unsafe extern "C" fn menu_will_open(_this: Obj, _cmd: Sel, menu: Obj) {
         // which runs in the tracking mode too, is what keeps it live.
         if let Some(poller) = state.poller.as_ref() {
             poller.request(true, &[]);
-            schedule_collect(state);
         }
     });
 }
@@ -732,7 +730,7 @@ fn make_controller() -> Obj {
             ("demoOpen:", demo_open as *const ()),
             ("demoClose:", demo_close as *const ()),
             ("demoActions:", demo_actions as *const ()),
-            ("collect:", collect as *const ()),
+            ("screenStateChanged:", screen_state_changed as *const ()),
             ("reopenMenu:", reopen_menu as *const ()),
             ("updatePoll:", update_poll as *const ()),
             ("menuNeedsUpdate:", menu_needs_update as *const ()),
@@ -969,6 +967,11 @@ fn apply_status_length(state: &mut AppState, slots: &[(Category, String)]) {
 }
 
 fn update_status_titles(state: &mut AppState) {
+    // The one write that costs real energy: a redraw of the status item goes
+    // through WindowServer and FrontBoard. Skipped while nobody can see it.
+    if !state.bar_visible {
+        return;
+    }
     unsafe {
         let categories = state.prefs.ordered_menu_bar();
         let stated = status_title(&state.prefs, &state.store);
@@ -1052,66 +1055,55 @@ fn shown_categories(state: &AppState) -> Vec<(Category, Option<String>)> {
 }
 
 fn tick(state: &mut AppState) {
+    // Anything the poller finished is applied here as a fallback; normally it
+    // arrives on its own, through `drain_imp`.
+    drain(state);
     // The poll runs on the worker thread, so this only asks for one and then
     // comes back for the result. Nothing is read on the main thread.
     match state.poller.as_ref() {
         Some(poller) => {
             let full = !state.open_menu.is_null();
             poller.request(full, &shown_categories(state));
-            schedule_collect(state);
         }
         None => {
             state.store.refresh();
             show_latest(state, true);
         }
     }
+    schedule_ticks(state);
 }
 
-/// Picks up a snapshot a tick asked for.
+/// Applies the newest finished poll, if one landed.
 ///
-/// It applies whatever arrived and arms nothing of its own: a snapshot that is
-/// not ready yet is simply collected by the next refresh tick, so the menu
-/// updates on the interval the user configured whether it is open or closed.
-unsafe extern "C" fn collect(_this: Obj, _cmd: Sel, _timer: Obj) {
-    with_state(|state| {
-        unsafe {
-            if !state.collect_timer.is_null() {
-                objc::release(state.collect_timer);
-                state.collect_timer = std::ptr::null_mut();
-            }
+/// The poller wakes the main queue the moment a snapshot is ready, so this
+/// runs as one event rather than as a timer that goes looking: a timer to
+/// collect would be a second wakeup per refresh, and under load several.
+fn drain(state: &mut AppState) {
+    let fresh = match state.poller.as_ref().map(|poller| poller.take()) {
+        Some(Polled::Snapshot(snapshot)) => {
+            state.store.apply(snapshot);
+            true
         }
-        let fresh = match state.poller.as_ref().map(|poller| poller.take()) {
-            Some(Polled::Snapshot(snapshot)) => {
-                state.collect_waits = 0;
-                state.store.apply(snapshot);
-                true
-            }
-            Some(Polled::Dead) => {
-                // The worker died: without this the menu keeps presenting its
-                // last reading as if it were live.
-                restart_poller(state);
-                look_again(state);
-                false
-            }
-            Some(Polled::Empty) | None => {
-                look_again(state);
-                false
-            }
-        };
-        show_latest(state, fresh);
-    });
+        Some(Polled::Dead) => {
+            // The worker died: without this the menu keeps presenting its
+            // last reading as if it were live.
+            restart_poller(state);
+            false
+        }
+        Some(Polled::Empty) | None => false,
+    };
+    show_latest(state, fresh);
 }
 
-/// Arms one more short wait for a poll that has not finished. Without it the
-/// result of a slow poll — the first of a session opens the driver and
-/// enumerates every key — would sit in the channel until the next refresh
-/// tick, and the menu would show the numbers from before the restart.
-fn look_again(state: &mut AppState) {
-    if state.collect_waits >= COLLECT_RETRIES {
-        return;
-    }
-    state.collect_waits = state.collect_waits.saturating_add(1);
-    schedule_collect(state);
+/// Runs `drain` on the main thread. The poller calls this through
+/// `wake_main` from its own thread, which is the one wakeup a poll costs.
+unsafe extern "C" fn drain_imp(_context: *mut std::ffi::c_void) {
+    with_state(drain);
+}
+
+/// Tells the main run loop a snapshot is waiting.
+pub fn wake_main() {
+    objc::dispatch_main_async(drain_imp);
 }
 
 /// Replaces a poller whose thread is gone, a bounded number of times: a
@@ -1123,7 +1115,7 @@ fn restart_poller(state: &mut AppState) {
         return;
     }
     state.poller_restarts += 1;
-    state.poller = Some(crate::poller::Poller::start());
+    state.poller = Some(crate::poller::Poller::start(wake_main));
     if let Some(poller) = state.poller.as_ref() {
         poller.request(true, &[]);
     }
@@ -1161,30 +1153,13 @@ unsafe fn arm_timer(timer: Obj) {
     );
 }
 
-/// Arms the one-shot timer that collects the poll requested a moment ago.
-fn schedule_collect(state: &mut AppState) {
-    unsafe {
-        if !state.collect_timer.is_null() {
-            objc::send_void(state.collect_timer, "invalidate");
-            objc::release(state.collect_timer);
-            state.collect_timer = std::ptr::null_mut();
-        }
-        let timer = objc::send_timer(
-            objc::class("NSTimer"),
-            "timerWithTimeInterval:target:selector:userInfo:repeats:",
-            0.4,
-            state.controller,
-            objc::selector("collect:"),
-            std::ptr::null_mut(),
-            false,
-        );
-        arm_timer(timer);
-        state.collect_timer = objc::retain(timer);
-    }
-}
-
-/// One timer per refresh interval, with tolerance so the system can hold the
-/// wakeup until it has other work to do.
+/// Arms the one-shot timer that fires the next refresh.
+///
+/// One-shot rather than repeating so the interval can follow the user: an
+/// idle screen slows it down, an open menu and a returning user speed it back
+/// up, and the next fire can be re-timed without a second timer. The
+/// tolerance is what lets the system fold this wakeup into whatever else it
+/// is doing, which is most of the energy a timer costs.
 fn schedule_ticks(state: &mut AppState) {
     unsafe {
         if !state.tick_timer.is_null() {
@@ -1192,7 +1167,7 @@ fn schedule_ticks(state: &mut AppState) {
             objc::release(state.tick_timer);
             state.tick_timer = std::ptr::null_mut();
         }
-        let interval = state.prefs.interval;
+        let interval = refresh_interval(state);
         let timer = objc::send_timer(
             objc::class("NSTimer"),
             "timerWithTimeInterval:target:selector:userInfo:repeats:",
@@ -1200,11 +1175,108 @@ fn schedule_ticks(state: &mut AppState) {
             state.controller,
             objc::selector("tick:"),
             std::ptr::null_mut(),
-            true,
+            false,
         );
         objc::send_void_float(timer, "setTolerance:", (interval * 0.25).max(0.2));
         arm_timer(timer);
         state.tick_timer = objc::retain(timer);
+    }
+}
+
+/// How long to wait before the next refresh.
+///
+/// The configured interval is what an attentive user gets. With nobody at the
+/// machine, and no menu open to look at, the bar keeps refreshing at the slow
+/// cadence instead: the same numbers, a quarter of the wakeups.
+fn refresh_interval(state: &AppState) -> f64 {
+    let base = state.prefs.interval;
+    if !state.open_menu.is_null() || !state.bar_visible {
+        return base;
+    }
+    if objc::seconds_since_input() >= IDLE_AFTER {
+        (base * 4.0).min(IDLE_INTERVAL)
+    } else {
+        base
+    }
+}
+
+// MARK: - Screen visibility
+
+/// Names that mean the bar has just stopped being visible, and names that
+/// mean it is back. Everything else on either center is ignored.
+const HIDDEN_EVENTS: [&str; 4] = [
+    "NSWorkspaceScreensDidSleepNotification",
+    "NSWorkspaceWillSleepNotification",
+    "NSWorkspaceSessionDidResignActiveNotification",
+    "com.apple.screenIsLocked",
+];
+
+/// Watches for the moments the menu bar stops being on screen.
+///
+/// A menu bar app has no window to be occluded, and App Nap does not throttle
+/// a status item holder, so the only signal that nothing is being looked at is
+/// the display going down or the session going away. While that holds the
+/// refresh loop is stopped entirely, which is most of a laptop's day.
+unsafe fn watch_screen_state(controller: Obj) {
+    let shared = objc::send(objc::class("NSWorkspace"), "sharedWorkspace");
+    let workspace = objc::send(shared, "notificationCenter");
+    for name in [
+        "NSWorkspaceScreensDidSleepNotification",
+        "NSWorkspaceScreensDidWakeNotification",
+        "NSWorkspaceWillSleepNotification",
+        "NSWorkspaceDidWakeNotification",
+        "NSWorkspaceSessionDidResignActiveNotification",
+        "NSWorkspaceSessionDidBecomeActiveNotification",
+    ] {
+        objc::add_observer(
+            workspace,
+            controller,
+            objc::selector("screenStateChanged:"),
+            name,
+        );
+    }
+    // The lock screen has no notification in AppKit; the distributed pair is
+    // what every menu bar utility uses, and a missed one is harmless because
+    // the display also sleeps behind the lock.
+    let distributed = objc::send(objc::class("NSDistributedNotificationCenter"), "defaultCenter");
+    for name in ["com.apple.screenIsLocked", "com.apple.screenIsUnlocked"] {
+        objc::add_observer(
+            distributed,
+            controller,
+            objc::selector("screenStateChanged:"),
+            name,
+        );
+    }
+}
+
+unsafe extern "C" fn screen_state_changed(_this: Obj, _cmd: Sel, note: Obj) {
+    let name = objc::nsstring_to_string(objc::send(note, "name"));
+    let visible = !HIDDEN_EVENTS.contains(&name.as_str());
+    with_state(|state| set_bar_visible(state, visible));
+}
+
+/// Starts or stops the refresh loop with the bar.
+///
+/// Coming back also asks for a full poll, so the first thing drawn after the
+/// display wakes is a fresh reading rather than the one from last night.
+fn set_bar_visible(state: &mut AppState, visible: bool) {
+    if state.bar_visible == visible {
+        return;
+    }
+    state.bar_visible = visible;
+    if visible {
+        if let Some(poller) = state.poller.as_ref() {
+            poller.request(true, &[]);
+        }
+        schedule_ticks(state);
+        return;
+    }
+    unsafe {
+        if !state.tick_timer.is_null() {
+            objc::send_void(state.tick_timer, "invalidate");
+            objc::release(state.tick_timer);
+            state.tick_timer = std::ptr::null_mut();
+        }
     }
 }
 
@@ -1948,8 +2020,7 @@ pub fn dump_menu() -> String {
             open_submenu: None,
             poller: None,
             tick_timer: std::ptr::null_mut(),
-            collect_timer: std::ptr::null_mut(),
-            collect_waits: 0,
+            bar_visible: true,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
@@ -2149,8 +2220,7 @@ pub fn render_rows(path: &str) {
             open_submenu: None,
             poller: None,
             tick_timer: std::ptr::null_mut(),
-            collect_timer: std::ptr::null_mut(),
-            collect_waits: 0,
+            bar_visible: true,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
@@ -2280,8 +2350,7 @@ pub fn bench_menu() -> String {
             open_submenu: None,
             poller: None,
             tick_timer: std::ptr::null_mut(),
-            collect_timer: std::ptr::null_mut(),
-            collect_waits: 0,
+            bar_visible: true,
             last_title: String::new(),
             login_item: std::ptr::null_mut(),
             last_signature: String::new(),
@@ -2347,6 +2416,22 @@ pub fn bench_menu() -> String {
             }
             let single_ms = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
 
+            // The bar a fresh install starts with, plus the averaged
+            // temperature: the poll this app actually runs while it idles.
+            let with_temperature = vec![
+                (Category::Memory, None),
+                (Category::Processor, None),
+                (Category::Temperature, None),
+            ];
+            // One poll to fill the family's cache, then the steady state: what
+            // an idle bar costs once every key has a value.
+            state.store.refresh_shown(&with_temperature);
+            let start = Instant::now();
+            for _ in 0..10 {
+                state.store.refresh_shown(&with_temperature);
+            }
+            let temperature_ms = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
+
             let rows = objc::send_int_result(
                 objc::send(menu, "itemArray"),
                 "count",
@@ -2370,6 +2455,7 @@ pub fn bench_menu() -> String {
                  sensor poll (all nine): {sensor_ms:.2} ms\n\
                  sensor poll (menu bar only): {shown_ms:.2} ms\n\
                  sensor poll (one sensor): {single_ms:.2} ms\n\
+                 sensor poll (average temperature on the bar): {temperature_ms:.2} ms\n\
                  menu bar after a subset poll: {sample}\n",
                 reading.sensors.len() + 2
             )

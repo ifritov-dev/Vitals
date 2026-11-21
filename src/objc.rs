@@ -197,6 +197,21 @@ pub unsafe fn send_obj_sel_obj(obj: Obj, sel: &str, a: Obj, action: Sel, b: Obj)
     function(obj, selector(sel), a, action, b)
 }
 
+/// `-addObserver:selector:name:object:`: an object, a selector, a name and no
+/// object, which is the shape every notification registration takes here.
+pub unsafe fn add_observer(center: Obj, observer: Obj, action: Sel, name: &str) {
+    let function: unsafe extern "C" fn(Obj, Sel, Obj, Sel, Obj, Obj) =
+        transmute(objc_msgSend as *const ());
+    function(
+        center,
+        selector("addObserver:selector:name:object:"),
+        observer,
+        action,
+        nsstring(name),
+        std::ptr::null_mut(),
+    );
+}
+
 pub unsafe fn send_obj_two_floats(obj: Obj, sel: &str, a: f64, b: f64) -> Obj {
     let function: unsafe extern "C" fn(Obj, Sel, f64, f64) -> Obj = transmute(objc_msgSend as *const ());
     function(obj, selector(sel), a, b)
@@ -356,4 +371,48 @@ pub unsafe fn nsstring_to_string(value: Obj) -> String {
         return String::new();
     }
     std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+}
+
+// MARK: - Cross-thread wakeup and user activity
+
+#[link(name = "System")]
+extern "C" {
+    fn dispatch_async_f(
+        queue: *mut c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+    /// The main queue object itself: `dispatch_get_main_queue` is inlined in
+    /// the headers and has no symbol to link against.
+    static _dispatch_main_q: c_void;
+}
+
+/// Runs `work` on the main queue. `dispatch_async_f` takes a C function
+/// pointer, so this needs no block and no libdispatch header: the call is one
+/// enqueue, which is what wakes the run loop when a poll finishes.
+pub fn dispatch_main_async(work: unsafe extern "C" fn(*mut c_void)) {
+    unsafe {
+        let main_queue = std::ptr::addr_of!(_dispatch_main_q) as *mut c_void;
+        dispatch_async_f(main_queue, std::ptr::null_mut(), work);
+    }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state: u32, event_type: u32) -> f64;
+}
+
+/// Seconds since the last keyboard, mouse or trackpad input in this session.
+/// Zero when the system will not say, which reads as "the user is here" and
+/// keeps the configured refresh interval.
+pub fn seconds_since_input() -> f64 {
+    // kCGEventSourceStateCombinedSessionState, kCGAnyInputEventType.
+    const COMBINED_SESSION: u32 = 0;
+    const ANY_INPUT: u32 = u32::MAX;
+    let seconds = unsafe { CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION, ANY_INPUT) };
+    if seconds.is_finite() && seconds > 0.0 {
+        seconds
+    } else {
+        0.0
+    }
 }

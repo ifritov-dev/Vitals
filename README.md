@@ -67,7 +67,10 @@ have put there, and clicking it opens the dropdown.
   picking the row that is already active removes the category from the bar.
 - **Refresh Interval** — 1 to 10 seconds, 5 by default. Only the categories on
   the menu bar are polled, and the dropdown follows the same interval while it
-  is open; the rest keep their last reading.
+  is open; the rest keep their last reading. Two things stretch it on their
+  own: two minutes without input slow the bar to 20 seconds, and a display
+  that is asleep or a screen that is locked stops the refresh loop completely,
+  which restarts with a fresh reading the moment the bar is back on screen.
 - **Fixed Status Width** — keeps the menu bar item at the width the categories
   on it need, so a reading that grows ("9°" to "100°") widens it once instead
   of shifting the whole bar on every refresh. Turn it off to let the item size
@@ -84,6 +87,30 @@ have put there, and clicking it opens the dropdown.
 Readings update in place while the menu is open, and a sensor whose key stops
 answering falls back to *No data* after three misses rather than showing a
 stale number forever.
+
+## What it costs
+
+A menu bar app that polls sensors is only worth running if it is nearly free,
+so the expensive parts are scheduled rather than ticked:
+
+- **A redraw is the pricey part, not the reading.** Writing a new title to the
+  status item runs through WindowServer and FrontBoard and costs tens of
+  millions of instructions — an order of magnitude more than a poll of every
+  sensor. The title is therefore only written when its text actually changes,
+  and never while the bar is off screen.
+- **Nothing runs behind a dark display.** The refresh loop stops on display
+  sleep, screen lock and fast user switching, and resumes with a full poll on
+  wake. Measured on an M1 Pro: exactly zero wakeups, zero instructions and
+  zero energy in that state.
+- **An average samples a slice.** A category showing its average reads an
+  eighth of its sensors per refresh (about 30 driver calls instead of 240 for
+  temperature) and averages that slice against the values the rest of the
+  family still holds, so the average still covers every sensor. Opening the
+  dropdown polls everything fresh.
+- **Sleeping is free.** The app holds no power assertions and does not fight
+  App Nap, `caffeinate` or the system sleep timer. One-shot timers carry a
+  tolerance so their wakeup can be folded into whatever else the machine is
+  doing.
 
 ## Updates
 
