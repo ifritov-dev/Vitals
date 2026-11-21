@@ -1,9 +1,9 @@
 name: Build
 
+# Manual only: nothing here runs on a push or a pull request. Start it from
+# Actions → Build → Run workflow when a build and the self-test are wanted.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
