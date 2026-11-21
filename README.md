@@ -1,8 +1,12 @@
-# Vitals
+<h1 align="center">Vitals</h1>
 
 A macOS menu bar monitor for the numbers a Mac will tell you if you ask: CPU,
 memory, temperatures, fan speeds, battery, network and disk. Native AppKit, no
 web view, no Electron, one dependency (`libc`) and about 6,000 lines of Rust.
+
+<div align="center">
+  <img width="458" height="332" alt="image" src="https://github.com/user-attachments/assets/d01a4626-388e-4a74-b025-9c310a9dc2d8" />
+</div>
 
 Every sensor is read from the same places `powermetrics`, `pmset` and
 Activity Monitor read them — the AppleSMC IOKit driver, `mach` host statistics,
