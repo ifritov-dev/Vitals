@@ -973,7 +973,6 @@ fn update_status_titles(state: &mut AppState) {
         return;
     }
     unsafe {
-        let categories = state.prefs.ordered_menu_bar();
         let stated = status_title(&state.prefs, &state.store);
         if stated == state.last_title && !state.status_item.is_null() {
             return;
@@ -1005,19 +1004,6 @@ fn update_status_titles(state: &mut AppState) {
             // Committed after the draw: a call that found no button must not
             // leave the cache claiming a title the item never got.
             state.last_title = stated;
-            let tooltip = categories
-                .iter()
-                .map(|category| {
-                    let reading = state.store.get(*category);
-                    format!(
-                        "{}: {}",
-                        category.title(),
-                        reading.reading_for(state.prefs.selection(*category).map(|s| s.as_str())).text
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            objc::send_void_obj(button, "setToolTip:", objc::nsstring(&tooltip));
         }
     }
 }
