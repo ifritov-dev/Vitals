@@ -26,8 +26,9 @@ struct VmStatistics64 {
     lookups: u64,
     hits: u64,
     purges: u64,
-    purgeable_count: u64,
-    speculative_count: u64,
+    // natural_t (u32) in XNU's vm_statistics64; u64 here shifts every later field.
+    purgeable_count: u32,
+    speculative_count: u32,
     decompressions: u64,
     compressions: u64,
     swapins: u64,
