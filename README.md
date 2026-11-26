@@ -213,6 +213,13 @@ make app && dist/Vitals.app/Contents/MacOS/Vitals --dump-menu
 font, so the app's own resources only exist in the bundle that `make app`
 builds.
 
+## Contributing
+
+Issues that come with `--dump` output are the ones that get fixed fastest. For
+patches, [CONTRIBUTING.md](CONTRIBUTING.md) covers the setup, the checks a
+change has to pass (`make verify` above all), and the ground rules that keep the
+app at one dependency.
+
 ## Releases
 
 `.github/workflows/release.yml` runs on demand from the **Actions** tab:
